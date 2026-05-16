@@ -456,6 +456,63 @@ def _pr_is_still_open(pr_number: int) -> bool:
     return True
 
 
+
+def _prs_are_still_open(pr_numbers: list) -> dict:
+    """Return a dictionary mapping PR numbers to their open status.
+
+    Like `_pr_is_still_open`, but batches the requests using a single
+    GraphQL query to avoid N+1 network calls.
+    """
+    if not pr_numbers:
+        return {}
+
+    query_parts = []
+    for pr in pr_numbers:
+        query_parts.append(
+            f"pr_{pr}: pullRequest(number: {pr}) {{ state isDraft isCrossRepository }}"
+        )
+
+    query = "query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { " + " ".join(query_parts) + " } }"
+
+    try:
+        data = _gh_json([
+            "api", "graphql",
+            "-F", "owner=:owner",
+            "-F", "repo=:repo",
+            "-f", f"query={query}"
+        ])
+    except CommandError as exc:
+        return {pr: exc for pr in pr_numbers}
+
+    result = {}
+    repo_data = data.get("data", {}).get("repository", {})
+
+    for pr in pr_numbers:
+        pr_data = repo_data.get(f"pr_{pr}")
+        if not pr_data:
+            result[pr] = CommandError(f"GraphQL response missing data for PR {pr}")
+            continue
+
+        state = pr_data.get("state")
+        if not isinstance(state, str):
+            result[pr] = CommandError(
+                f"gh api graphql for PR {pr} returned no state field; refusing to "
+                "interpret as not-open."
+            )
+            continue
+
+        if state.upper() != "OPEN":
+            result[pr] = False
+        elif pr_data.get("isDraft"):
+            result[pr] = False
+        elif pr_data.get("isCrossRepository"):
+            result[pr] = False
+        else:
+            result[pr] = True
+
+    return result
+
+
 _SOFT_FAIL_PATTERNS = (
     # CodeRabbit fails its check with this text when the org has run out of
     # review credits. The repo's review quality doesn't change with it, so

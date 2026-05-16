@@ -26,6 +26,7 @@ from .gh_ops import (
     _mark_pr_needs_review,
     _merge_pr,
     _pr_is_still_open,
+    _prs_are_still_open,
     _pr_review_comments,
     _pr_view,
     _prepare_pr_for_merge,
@@ -410,29 +411,30 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     seconds, so a PR that was merged moments before the supervisor started
     can still appear in the initial list. Spawning a child for it just
     wastes a process slot (the child errors out with "PR <N> is not open")
-    and produces noisy logs. A per-PR `gh pr view` is more authoritative.
+    and produces noisy logs. A per-PR batch `gh api graphql` query is more
+    authoritative.
 
-    Network/transient failures from `_pr_is_still_open` are surfaced as
+    Network/transient failures from `_prs_are_still_open` are surfaced as
     "keep this PR" — we only drop PRs that GitHub definitively reports as
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
     kept: List[int] = []
+    statuses = _prs_are_still_open(pr_numbers)
     for pr in pr_numbers:
-        try:
-            still_open = _pr_is_still_open(pr)
-        except CommandError as exc:
+        status = statuses.get(pr)
+        if isinstance(status, Exception):
             _print_step(
                 "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
+                "fan-out set.".format(pr, status)
             )
             kept.append(pr)
             continue
-        if still_open:
+        if status:
             kept.append(pr)
         else:
             _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
+                "PR #{} is no longer open (per batch check); skipping "
                 "fan-out spawn.".format(pr)
             )
     return kept
@@ -613,18 +615,19 @@ def _fan_out_all_prs(
                 # only drop PRs on definitive non-OPEN results — transient
                 # failures bubble up as "keep in respawn set" so a flaky
                 # network does not silently lose work.
-                for pr in list(last_exit_at.keys()):
-                    try:
-                        still_open = _pr_is_still_open(pr)
-                    except CommandError as exc:
+                prs_to_check = list(last_exit_at.keys())
+                statuses = _prs_are_still_open(prs_to_check)
+                for pr in prs_to_check:
+                    status = statuses.get(pr)
+                    if isinstance(status, Exception):
                         _print_step(
                             "Could not confirm PR #{} open state for respawn "
                             "({}); keeping it in the respawn set.".format(
-                                pr, exc
+                                pr, status
                             )
                         )
                         continue
-                    if not still_open:
+                    if not status:
                         _print_step(
                             "PR #{} is no longer open; dropping from respawn "
                             "set.".format(pr)
