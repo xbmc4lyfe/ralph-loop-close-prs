@@ -48,6 +48,14 @@ from .worktrees import (
     _ensure_pr_worktree,
 )
 
+
+def _write_stderr_fd(message: str):
+    try:
+        os.write(2, message.encode("utf-8", errors="replace"))
+    except OSError:
+        pass
+
+
 def _nonneg_int(value: str) -> int:
     try:
         parsed = int(value)
@@ -912,10 +920,9 @@ def main() -> int:
 
     def _handle_shutdown(signum, _frame):
         _shutdown_signal["name"] = signal.Signals(signum).name
-        sys.stderr.write(
+        _write_stderr_fd(
             "\nReceived {}; cleaning up...\n".format(_shutdown_signal["name"])
         )
-        sys.stderr.flush()
         raise SystemExit(130 if signum == signal.SIGINT else 143)
 
     signal.signal(signal.SIGINT, _handle_shutdown)

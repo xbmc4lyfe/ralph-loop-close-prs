@@ -204,7 +204,7 @@ def test_main_dry_run_validates_pr_without_mutating_local_or_remote_state(
 
 
 def test_main_signal_handler_exits_with_shell_status(
-    monkeypatch, cli_args, capsys
+    monkeypatch, cli_args, capfd
 ):
     captured = {}
 
@@ -222,7 +222,41 @@ def test_main_signal_handler_exits_with_shell_status(
         cli.main()
 
     assert raised.value.code == 130
-    assert "Received SIGINT" in capsys.readouterr().err
+    assert "Received SIGINT" in capfd.readouterr().err
+
+
+def test_main_signal_handler_does_not_use_buffered_stderr(
+    monkeypatch, cli_args, capfd
+):
+    captured = {}
+
+    class ReentrantStderr:
+        def write(self, _text):
+            raise RuntimeError("reentrant call inside <_io.BufferedWriter name='<stderr>'>")
+
+        def flush(self):
+            raise RuntimeError("reentrant flush")
+
+    def capture_signal(signum, handler):
+        captured[signum] = handler
+
+    def interrupt():
+        original_stderr = cli.sys.stderr
+        cli.sys.stderr = ReentrantStderr()
+        try:
+            captured[signal.SIGINT](signal.SIGINT, None)
+        finally:
+            cli.sys.stderr = original_stderr
+
+    monkeypatch.setattr(cli, "_parse_args", lambda: cli_args())
+    monkeypatch.setattr(cli.signal, "signal", capture_signal)
+    monkeypatch.setattr(cli, "_ensure_runtime_identity", interrupt)
+
+    with pytest.raises(SystemExit) as raised:
+        cli.main()
+
+    assert raised.value.code == 130
+    assert "Received SIGINT" in capfd.readouterr().err
 
 
 @pytest.mark.parametrize(
