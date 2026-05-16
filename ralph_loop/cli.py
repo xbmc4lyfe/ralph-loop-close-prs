@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import re
 import shlex
@@ -460,7 +461,8 @@ def _supervisor_wait(event: "threading.Event", timeout: float) -> bool:
 def _post_addressed_comment_replies(
     pr_ref: str, addressed: List[Tuple[int, str]], round_number: int
 ) -> None:
-    for comment_id, summary in addressed:
+    def post_reply(item: Tuple[int, str]) -> None:
+        comment_id, summary = item
         summary_clean = (summary or "").strip()
         if not summary_clean:
             summary_clean = "(Codex did not provide a fix summary for this comment.)"
@@ -482,6 +484,16 @@ def _post_addressed_comment_replies(
                     comment_id
                 )
             )
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = {executor.submit(post_reply, item): item for item in addressed}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                _print_step(
+                    "Exception while replying to PR review comment: {}".format(exc)
+                )
 
 
 def _open_log_handle_cloexec(log_path: str) -> Any:
