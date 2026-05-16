@@ -51,8 +51,8 @@ def _wait_for_required_checks_green(
     branch: str,
     poll_seconds: int,
     timeout_seconds: int,
-    treat_optional_as_blocking: bool = True,
     deadline: Optional[float] = None,
+    no_checks_grace_seconds: int = 120,
 ) -> Tuple[bool, list]:
     _print_step("Waiting for required checks on PR branch {}".format(branch))
     started = time.monotonic()
@@ -78,29 +78,25 @@ def _wait_for_required_checks_green(
         _check_wall_clock(deadline)
         checks, were_required = _required_checks(branch)
         if not checks:
-            _print_step("No checks reported yet; waiting.")
-            if (time.monotonic() - started) > timeout_seconds:
-                raise CommandError(
-                    "Timed out waiting for checks to appear after {}s.".format(
-                        timeout_seconds
-                    )
+            elapsed = time.monotonic() - started
+            if elapsed >= no_checks_grace_seconds:
+                _print_step(
+                    "No checks reported after {}s grace; treating branch as "
+                    "having no CI and proceeding.".format(no_checks_grace_seconds)
                 )
+                return True, []
+            _print_step(
+                "No checks reported yet; waiting (grace {}s).".format(
+                    no_checks_grace_seconds
+                )
+            )
             sleep_for_next_poll()
             continue
-        if not were_required and not treat_optional_as_blocking:
-            _print_step(
-                "No required checks reported; ignoring optional check failures."
-            )
-            return True, checks
         summary = _bucket_summary(checks)
         scope = "Required" if were_required else "All (no required reported)"
         _print_step("{} check buckets: {}".format(scope, summary))
         buckets = {check.get("bucket") for check in checks}
         if buckets.issubset({"pass", "skipping"}):
-            if not were_required:
-                _print_step("Required checks have not appeared yet; waiting.")
-                sleep_for_next_poll()
-                continue
             return True, checks
         if "pending" not in buckets:
             return False, checks

@@ -412,33 +412,39 @@ def test_wait_for_checks_green_polls_until_checks_appear(monkeypatch, spy):
     sleep.assert_called_once_with(1)
 
 
-def test_wait_for_checks_green_times_out_before_any_checks_appear(monkeypatch):
+def test_wait_for_checks_green_returns_success_after_no_checks_grace(monkeypatch, spy):
     monkeypatch.setattr(checks, "_required_checks", lambda _branch: ([], True))
-    monkeypatch.setattr(checks.time, "monotonic", spy_time([0, 11]))
+    monkeypatch.setattr(checks.time, "monotonic", spy_time([0, 1, 2, 11]))
+    sleep = spy()
+    monkeypatch.setattr(checks.time, "sleep", sleep)
 
-    with pytest.raises(CommandError, match="Timed out waiting for checks"):
-        checks._wait_for_required_checks_green(
-            branch="feature",
-            poll_seconds=1,
-            timeout_seconds=10,
-        )
+    assert checks._wait_for_required_checks_green(
+        branch="feature",
+        poll_seconds=1,
+        timeout_seconds=60,
+        no_checks_grace_seconds=5,
+    ) == (True, [])
 
 
 @pytest.mark.parametrize(
-    ("check_records", "were_required", "treat_optional_as_blocking", "expected"),
+    ("check_records", "were_required", "expected"),
     [
-        ([{"name": "lint", "bucket": "fail"}], False, False, True),
+        (
+            [{"name": "lint", "bucket": "pass"}],
+            False,
+            True,
+        ),
         (
             [{"name": "unit", "bucket": "pass"}, {"name": "skip", "bucket": "skipping"}],
             True,
             True,
-            True,
         ),
-        ([{"name": "unit", "bucket": "fail"}], True, True, False),
+        ([{"name": "unit", "bucket": "fail"}], True, False),
+        ([{"name": "lint", "bucket": "fail"}], False, False),
     ],
 )
 def test_wait_for_checks_green_returns_terminal_check_states(
-    monkeypatch, check_records, were_required, treat_optional_as_blocking, expected
+    monkeypatch, check_records, were_required, expected
 ):
     monkeypatch.setattr(
         checks, "_required_checks", lambda _branch: (check_records, were_required)
@@ -448,7 +454,6 @@ def test_wait_for_checks_green_returns_terminal_check_states(
         branch="feature",
         poll_seconds=1,
         timeout_seconds=10,
-        treat_optional_as_blocking=treat_optional_as_blocking,
     ) == (expected, check_records)
 
 
@@ -471,15 +476,14 @@ def test_wait_for_checks_green_waits_for_pending_checks(monkeypatch, spy):
     sleep.assert_called_once_with(3)
 
 
-def test_wait_for_checks_green_does_not_succeed_on_optional_checks_before_required(
+def test_wait_for_checks_green_succeeds_on_all_passing_optional_checks(
     monkeypatch, spy
 ):
     optional = [{"name": "lint", "bucket": "pass"}]
-    required = [{"name": "unit", "bucket": "pass"}]
     monkeypatch.setattr(
         checks,
         "_required_checks",
-        spy(side_effect=[(optional, False), (required, True)]),
+        spy(return_value=(optional, False)),
     )
     sleep = spy()
     monkeypatch.setattr(checks.time, "sleep", sleep)
@@ -488,8 +492,7 @@ def test_wait_for_checks_green_does_not_succeed_on_optional_checks_before_requir
         branch="feature",
         poll_seconds=3,
         timeout_seconds=10,
-    ) == (True, required)
-    sleep.assert_called_once_with(3)
+    ) == (True, optional)
 
 
 def test_wait_for_checks_green_caps_sleep_to_remaining_timeout(monkeypatch, spy):
