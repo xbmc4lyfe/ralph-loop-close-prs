@@ -1,4 +1,5 @@
 import importlib
+from unittest.mock import call
 
 import pytest
 
@@ -59,6 +60,42 @@ def test_gh_run_with_retry_uses_unbounded_capture_and_deadline_aware_sleep(
     assert run.call_args_list[0].kwargs["max_output_bytes"] is None
     assert run.call_args_list[0].kwargs["replay_output"] is False
     sleep.assert_called_once_with(0.1, "gh retry backoff")
+
+
+def test_gh_run_with_retry_sleeps_for_rate_limit_until_success(
+    monkeypatch, spy, completed_process
+):
+    run = spy(
+        side_effect=[
+            completed_process(
+                returncode=1,
+                stderr="GraphQL: API rate limit already exceeded for user ID 123.",
+            ),
+            completed_process(
+                returncode=1,
+                stderr="GraphQL: API rate limit already exceeded for user ID 123.",
+            ),
+            completed_process(stdout="ok\n"),
+        ]
+    )
+    sleep = spy()
+    monkeypatch.setattr(gh_ops, "_run_command", run)
+    monkeypatch.setattr(gh_ops, "_sleep_with_command_deadline", sleep)
+
+    result = gh_ops._gh_run_with_retry(
+        ["pr", "view", "112"],
+        check=True,
+        capture_output=True,
+        max_attempts=1,
+        base_delay=0.1,
+    )
+
+    assert result.stdout == "ok\n"
+    assert run.call_count == 3
+    assert sleep.call_args_list == [
+        call(300.0, "gh rate-limit backoff"),
+        call(300.0, "gh rate-limit backoff"),
+    ]
 
 
 def test_gh_run_with_retry_raises_for_checked_permanent_failure(

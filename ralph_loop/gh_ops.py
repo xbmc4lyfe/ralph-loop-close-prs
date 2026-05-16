@@ -32,12 +32,23 @@ _GH_TRANSIENT_MARKERS = (
     "eof",
     "i/o timeout",
 )
+_GH_RATE_LIMIT_MARKERS = (
+    "api rate limit already exceeded",
+    "rate limit exceeded",
+    "secondary rate limit",
+    "exceeded a secondary rate limit",
+)
+_GH_RATE_LIMIT_SLEEP_SECONDS = 300.0
 
 
 def _sleep_with_command_deadline(seconds: float, reason: str):
     remaining = _remaining_command_timeout(reason)
     delay = seconds if remaining is None else min(seconds, remaining)
     time.sleep(delay)
+
+
+def _is_gh_rate_limited(text: str) -> bool:
+    return any(marker in text for marker in _GH_RATE_LIMIT_MARKERS)
 
 
 def _gh_run_with_retry(
@@ -50,7 +61,8 @@ def _gh_run_with_retry(
 ) -> subprocess.CompletedProcess:
     cmd = ["gh"] + list(args)
     last_completed = None
-    for attempt in range(1, max_attempts + 1):
+    attempt = 1
+    while True:
         completed = _run_command(
             cmd,
             check=False,
@@ -62,6 +74,16 @@ def _gh_run_with_retry(
         if completed.returncode == 0:
             return completed
         stderr_text = (completed.stderr or "").lower()
+        if _is_gh_rate_limited(stderr_text):
+            _print_step(
+                "GitHub API rate limit exhausted; sleeping {}s before retrying gh.".format(
+                    int(_GH_RATE_LIMIT_SLEEP_SECONDS)
+                )
+            )
+            _sleep_with_command_deadline(
+                _GH_RATE_LIMIT_SLEEP_SECONDS, "gh rate-limit backoff"
+            )
+            continue
         is_transient = any(marker in stderr_text for marker in _GH_TRANSIENT_MARKERS)
         if is_transient and attempt < max_attempts:
             delay = min(base_delay * (2 ** (attempt - 1)), 30.0)
@@ -71,6 +93,7 @@ def _gh_run_with_retry(
                 )
             )
             _sleep_with_command_deadline(delay, "gh retry backoff")
+            attempt += 1
             continue
         break
     if check and last_completed is not None and last_completed.returncode != 0:

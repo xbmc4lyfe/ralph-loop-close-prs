@@ -105,6 +105,10 @@ The script resolves the PR with `_pr_view()`, which runs:
 
 - `gh pr view <ref> --json number,url,state,headRefName,baseRefName,isDraft,isCrossRepository`
 
+If GitHub reports API rate-limit exhaustion for a `gh` request, Ralph sleeps in
+that process for five minutes and retries the same request. Other known
+transient `gh` failures still use the shorter exponential retry path.
+
 `<ref>` is either:
 
 - the explicit PR number from `--pr`, or
