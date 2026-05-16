@@ -176,8 +176,18 @@ def _sync_existing_worktree(*, path: str, start_ref: str):
         capture_output=True,
     )
     if (status.stdout or "").strip():
-        raise CommandError(
-            "Existing PR worktree {} is dirty; refusing to reset it.".format(path)
+        _print_step(
+            "Discarding uncommitted mid-flight changes in worktree {}".format(path)
+        )
+        _run_command(
+            ["git", "-C", path, "reset", "--hard", "HEAD"],
+            check=True,
+            capture_output=True,
+        )
+        _run_command(
+            ["git", "-C", path, "clean", "-fdx"],
+            check=True,
+            capture_output=True,
         )
     head = _run_command(
         ["git", "-C", path, "rev-parse", "HEAD"],
