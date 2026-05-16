@@ -1,15 +1,19 @@
 # Ralph Loop
 
-This repository currently contains one main script:
+This repository contains a compatibility script plus the implementation package:
 
 - `codex_ralph_wiggum_loop.py`
+- `ralph_loop/`
+- `GUIDE.md`
 
 It is a Python automation loop for taking an open GitHub PR, running Codex-driven review and repair cycles, waiting for CI, optionally repairing CI failures, then optionally rebasing and merging the PR.
 
+For a full end-to-end walkthrough of the current behavior, see `GUIDE.md`.
+
 ## Current Repo Shape
 
-- Source code is currently a single file: `codex_ralph_wiggum_loop.py`
-- The repo is not broken into modules yet
+- `codex_ralph_wiggum_loop.py` is the executable compatibility entry point
+- Source code lives in focused modules under `ralph_loop/`
 - Running the script can create a local `__pycache__/` directory
 
 ## What The Script Does
@@ -120,5 +124,5 @@ python3 codex_ralph_wiggum_loop.py --pr 123 --base main --skip-merge
 ## Notes
 
 - If you do not pass `--pr`, the script uses the current branch name as the PR reference.
-- This repo currently has no modular package structure; the logic is all in one Python file.
+- The CLI remains available through `codex_ralph_wiggum_loop.py`.
 - The only generated artifact currently seen in the repo is `__pycache__/`.
