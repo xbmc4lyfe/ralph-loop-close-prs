@@ -101,19 +101,20 @@ def _infer_review_pass_without_marker(last_message: str) -> Optional[bool]:
 
 def _run_review_fix_round(round_number: int, base: str, model: Optional[str]) -> bool:
     _print_step("Codex review/fix round {}".format(round_number))
+    del base
     prompt = textwrap.dedent(
         """
-        Run `/review --base {base}`.
+        Run `/review`.
         If `/review` finds actionable issues, fix them in the current repository.
         Do not commit or push.
-        Then run `/review --base {base}` exactly one more time.
+        Then run `/review` exactly one more time.
         If no actionable issues remain after that second review, return:
         REVIEW_PASS=yes
         Otherwise return:
         REVIEW_PASS=no
         Respond with exactly one line and nothing else.
         """
-    ).strip().format(base=base)
+    ).strip()
     marker_value, last_message = _codex_exec_with_marker(
         prompt=prompt,
         marker_regex=r"REVIEW_PASS=(yes|no)",
@@ -141,16 +142,17 @@ def _run_review_fix_round(round_number: int, base: str, model: Optional[str]) ->
 
 def _run_pre_push_review_gate(*, base: str, model: Optional[str]) -> bool:
     _print_step("Running Codex /review gate before push")
+    del base
     prompt = textwrap.dedent(
         """
-        Run `/review --base {base}` exactly once and do not modify files.
+        Run `/review` exactly once and do not modify files.
         If no actionable issues remain, return:
         PRE_PUSH_REVIEW_OK=yes
         Otherwise return:
         PRE_PUSH_REVIEW_OK=no
         Respond with exactly one line and nothing else.
         """
-    ).strip().format(base=base)
+    ).strip()
     marker_value, last_message = _codex_exec_with_marker(
         prompt=prompt,
         marker_regex=r"PRE_PUSH_REVIEW_OK=(yes|no)",

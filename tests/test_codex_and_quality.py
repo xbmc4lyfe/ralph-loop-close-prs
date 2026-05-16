@@ -160,7 +160,8 @@ def test_review_round_uses_marker_inference_and_error_paths(monkeypatch, spy):
     monkeypatch.setattr(codex_agent, "_codex_exec_with_marker", run)
 
     assert codex_agent._run_review_fix_round(2, "main", "model") is True
-    assert "/review --base main" in run.call_args.kwargs["prompt"]
+    assert "/review" in run.call_args.kwargs["prompt"]
+    assert "--base" not in run.call_args.kwargs["prompt"]
     assert "Do not commit or push." in run.call_args.kwargs["prompt"]
 
     monkeypatch.setattr(
