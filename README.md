@@ -10,11 +10,33 @@ It is a Python automation loop for taking an open GitHub PR, running Codex-drive
 
 For a full end-to-end walkthrough of the current behavior, see `GUIDE.md`.
 
-## Current Repo Shape
+## Codebase Layout
 
-- `codex_ralph_wiggum_loop.py` is the executable compatibility entry point
-- Source code lives in focused modules under `ralph_loop/`
-- Running the script can create a local `__pycache__/` directory
+- `codex_ralph_wiggum_loop.py`: executable compatibility entry point. Keep this
+  path working for existing shell history and docs.
+- `ralph_loop/cli.py`: argument parsing, signal handling, and top-level
+  orchestration.
+- `ralph_loop/config.py`: environment-derived defaults and fixed labels.
+- `ralph_loop/errors.py`: shared `CommandError`.
+- `ralph_loop/process.py`: subprocess execution, command rendering, step
+  logging, and output formatting.
+- `ralph_loop/git_ops.py`: git branch, config, status, reset, and rebase
+  helpers.
+- `ralph_loop/gh_ops.py`: GitHub CLI retry, JSON, PR metadata, labels, reviews,
+  checks, and merge helpers.
+- `ralph_loop/identity.py`: GitHub/git identity and signing setup/validation.
+- `ralph_loop/worktrees.py`: per-PR lock handling and PR worktree
+  creation/reuse.
+- `ralph_loop/codex_agent.py`: `codex exec` calls, marker parsing, and Codex
+  review/repair prompts.
+- `ralph_loop/checks.py`: GitHub check bucket formatting and required-check
+  polling.
+- `ralph_loop/quality.py`: local `just ci` / `just test` gates and commit/push
+  retry flow.
+- `ralph_loop/runtime.py`: wall-clock deadline and round-number helpers.
+- `tests/test_helpers.py`: focused unit coverage for pure helper behavior.
+- `GUIDE.md`: longer control-flow and safety walkthrough.
+- Running the script or tests can create local `__pycache__/` directories.
 
 ## What The Script Does
 
@@ -114,6 +136,7 @@ Important flags:
 - `--skip-rebase`: skip both the initial and final rebase steps
 - `--skip-merge`: stop after CI is green without merging
 - `--worktree-root <path>`: override the worktree root
+- `--max-wall-clock-seconds <n>`: cap total runtime, `0` means unlimited
 
 Example:
 
@@ -126,3 +149,13 @@ python3 codex_ralph_wiggum_loop.py --pr 123 --base main --skip-merge
 - If you do not pass `--pr`, the script uses the current branch name as the PR reference.
 - The CLI remains available through `codex_ralph_wiggum_loop.py`.
 - The only generated artifact currently seen in the repo is `__pycache__/`.
+
+## Small TODO
+
+- Expand tests around `ralph_loop.cli.main()` with mocked GitHub, git, Codex,
+  and `just` helpers so the module split has coverage for the full orchestration
+  path without touching a real PR.
+- Add `.gitignore` entries for local artifacts such as `__pycache__/`,
+  `.DS_Store`, `.coverage`, and `.ruff_cache/`.
+- Decide whether the older monolith-focused untracked tests should be rewritten
+  against the new module boundaries or removed.
