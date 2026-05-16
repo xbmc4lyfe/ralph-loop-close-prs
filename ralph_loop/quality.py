@@ -138,6 +138,8 @@ def _commit_and_push(
     max_local_quality_rounds: int,
     pre_round_sha: Optional[str] = None,
     deadline: Optional[float] = None,
+    provider: str = "openai",
+    reasoning_effort: Optional[str] = None,
 ) -> str:
     local_quality_round = 0
     review_gate_needed = require_review_gate
@@ -158,6 +160,8 @@ def _commit_and_push(
         if review_gate_needed and not _run_pre_push_review_gate(
             base=base,
             model=model,
+            provider=provider,
+            reasoning_effort=reasoning_effort,
         ):
             _print_step(
                 "Pre-push review found actionable issues; discarding generated changes."
@@ -184,6 +188,8 @@ def _commit_and_push(
             round_number=local_quality_round,
             failure_summary=failure_summary,
             model=model,
+            provider=provider,
+            reasoning_effort=reasoning_effort,
         )
         _check_wall_clock(deadline)
         if not ready:

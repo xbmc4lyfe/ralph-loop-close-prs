@@ -1335,11 +1335,14 @@ def test_fan_out_sighup_triggers_execv_with_supervisor_argv(
 
     # Capture installed signal handlers so we can fire SIGHUP synthetically.
     handlers = {}
+    previous_handlers = {}
     real_signal_signal = signal.signal
 
     def capture_signal(signum, handler):
         handlers[signum] = handler
-        return real_signal_signal(signum, signal.SIG_IGN)
+        previous = real_signal_signal(signum, signal.SIG_IGN)
+        previous_handlers.setdefault(signum, previous)
+        return previous
 
     monkeypatch.setattr(cli.signal, "signal", capture_signal)
 
@@ -1373,17 +1376,21 @@ def test_fan_out_sighup_triggers_execv_with_supervisor_argv(
         sys, "argv", [str(script_path), "--all-prs", "--base", "main"]
     )
 
-    with pytest.raises(SystemExit, match="execv-called"):
-        cli._fan_out_all_prs(
-            cli_args(
-                all_prs=True,
-                fan_out_log_dir=str(log_dir),
-                fan_out_respawn_backoff_seconds=1,
-                fan_out_stuck_timeout_seconds=60,
-            ),
-            ["script.py", "--all-prs"],
-            str(script_path),
-        )
+    try:
+        with pytest.raises(SystemExit, match="execv-called"):
+            cli._fan_out_all_prs(
+                cli_args(
+                    all_prs=True,
+                    fan_out_log_dir=str(log_dir),
+                    fan_out_respawn_backoff_seconds=1,
+                    fan_out_stuck_timeout_seconds=60,
+                ),
+                ["script.py", "--all-prs"],
+                str(script_path),
+            )
+    finally:
+        for signum, previous in previous_handlers.items():
+            real_signal_signal(signum, previous)
 
     assert len(exec_calls) == 1
     exec_path, exec_argv = exec_calls[0]
@@ -1408,11 +1415,14 @@ def test_fan_out_no_execv_when_normal_shutdown(monkeypatch, cli_args, tmp_path):
     monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
 
     handlers = {}
+    previous_handlers = {}
     real_signal_signal = signal.signal
 
     def capture_signal(signum, handler):
         handlers[signum] = handler
-        return real_signal_signal(signum, signal.SIG_IGN)
+        previous = real_signal_signal(signum, signal.SIG_IGN)
+        previous_handlers.setdefault(signum, previous)
+        return previous
 
     monkeypatch.setattr(cli.signal, "signal", capture_signal)
 
@@ -1435,16 +1445,20 @@ def test_fan_out_no_execv_when_normal_shutdown(monkeypatch, cli_args, tmp_path):
     script_path.write_text("# stub\n")
     log_dir = tmp_path / "logs"
 
-    rc = cli._fan_out_all_prs(
-        cli_args(
-            all_prs=True,
-            fan_out_log_dir=str(log_dir),
-            fan_out_respawn_backoff_seconds=1,
-            fan_out_stuck_timeout_seconds=60,
-        ),
-        ["script.py", "--all-prs"],
-        str(script_path),
-    )
+    try:
+        rc = cli._fan_out_all_prs(
+            cli_args(
+                all_prs=True,
+                fan_out_log_dir=str(log_dir),
+                fan_out_respawn_backoff_seconds=1,
+                fan_out_stuck_timeout_seconds=60,
+            ),
+            ["script.py", "--all-prs"],
+            str(script_path),
+        )
+    finally:
+        for signum, previous in previous_handlers.items():
+            real_signal_signal(signum, previous)
 
     assert rc == 0
     assert exec_calls == [], "SIGINT must not trigger os.execv"
