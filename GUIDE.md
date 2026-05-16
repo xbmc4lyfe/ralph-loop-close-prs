@@ -67,12 +67,16 @@ The script also enforces and/or sets this runtime identity:
 - `git config core.sshCommand "ssh -i /Users/allen/.ssh/id_ed25519_xbmc4lyfe -o IdentitiesOnly=yes -o IdentityAgent=none"`
 
 That means the script is intentionally tied to one operator identity.
+Environment overrides for SSH key paths and the worktree root expand a leading
+`~`. `RALPH_SSH_COMMAND` is parsed with normal shell quoting so leading `~`
+path tokens, including `key=~/path` values, can be expanded before writing
+`core.sshCommand`; commands that cannot be parsed are left as provided.
 
 ## CLI surface
 
 The script exposes these arguments:
 
-- `--pr <number>`: target a specific PR; if omitted, the current branch is used as the PR reference
+- `--pr <number>`: target a specific positive PR number; if omitted, the current branch is used as the PR reference
 - `--base <branch>`: expected PR base branch, default `main`
 - `--max-review-rounds <n>`: cap the review/fix loop; `0` means unbounded
 - `--max-ci-rounds <n>`: cap the CI repair loop; `0` means unbounded
@@ -82,15 +86,24 @@ The script exposes these arguments:
 - `--model <name>`: optional Codex model override
 - `--skip-rebase`: skip the initial and final rebase
 - `--skip-merge`: stop after the branch is green
+- `--dry-run`: resolve and validate the PR, then stop before local or remote mutations
 - `--worktree-root <path>`: override the root directory for PR worktrees
+- `--max-wall-clock-seconds <n>`: cap total runtime at loop, subprocess, local-quality repair, and check-polling boundaries; `0` means unbounded
 
 The integer parsers `_nonneg_int()` and `_pos_int()` enforce valid numeric flag values before execution starts.
+
+`--dry-run` is intentionally preflight-only. It reads the current branch when
+needed, fetches PR metadata with `gh pr view`, applies the normal PR metadata
+checks, prints the planned target, and exits. It does not update git config,
+acquire the PR lock, create or reuse a worktree, change directories, add labels,
+run Codex, run quality gates, wait for checks, rebase, push, reset generated
+changes, approve, merge, or delete branches.
 
 ## PR resolution and validation
 
 The script resolves the PR with `_pr_view()`, which runs:
 
-- `gh pr view <ref> --json number,url,state,headRefName,baseRefName,isDraft`
+- `gh pr view <ref> --json number,url,state,headRefName,baseRefName,isDraft,isCrossRepository`
 
 `<ref>` is either:
 
@@ -102,6 +115,7 @@ After fetching PR metadata, `main()` verifies:
 - the PR number is valid
 - the PR state is `OPEN`
 - the PR is not draft
+- the PR is not a fork / cross-repository PR
 - the PR base branch matches `--base`
 - the head branch exists
 - the head branch is not the same as the base branch
@@ -112,7 +126,7 @@ If any of those checks fail, execution stops immediately.
 
 Before it starts changing anything, the script acquires a lock with `_acquire_loop_lock(pr_number=...)`.
 
-That lock is keyed by PR number and prevents concurrent loop runs for the same PR. The lock is released in `finally`, so normal failures still unwind cleanly.
+That lock is keyed by PR number and prevents concurrent loop runs for the same PR. The lock file is persistent and the advisory lock is released in `finally`, so normal failures still unwind cleanly without creating an unlink race.
 
 There is also a secondary concurrency guard during branch checkout/worktree creation. If git reports that the branch is already in use by another worktree, the script prints the loop-already-running message and exits successfully instead of fighting over the branch.
 
@@ -136,7 +150,7 @@ The worktree flow is:
 
 1. Determine the desired worktree path.
 2. Fetch the PR branch or PR head ref with `_fetch_pr_branch_or_head(...)`.
-3. If the branch is already checked out in another worktree, reuse that worktree.
+3. If the branch is already checked out at a different worktree path, exit cleanly instead of running destructive cleanup outside the dedicated path.
 4. If the target path already exists, verify it is on the expected branch and reuse it.
 5. Otherwise create the worktree with `git worktree add ... -B <branch> <start-ref>`.
 
@@ -176,6 +190,10 @@ That helper:
 4. Reads the file back.
 5. Extracts a yes/no marker from the final message with `_extract_yes_no_marker(...)`.
 
+If `codex exec` exits non-zero, the helper raises `CommandError` before marker
+extraction. A captured last-message may be included in the error for
+diagnostics, but it is not trusted as a successful marker response.
+
 The markers are how the outer loop decides whether Codex believes a round passed or produced a usable fix.
 
 The script currently uses `danger-full-access` sandbox mode for these Codex runs.
@@ -190,8 +208,9 @@ That helper instructs Codex to:
 
 1. run `/review --base <base>`
 2. fix actionable issues if any exist
-3. run `/review --base <base>` exactly one more time
-4. respond with `REVIEW_PASS=yes` or `REVIEW_PASS=no`
+3. avoid commit and push operations
+4. run `/review --base <base>` exactly one more time
+5. respond with `REVIEW_PASS=yes` or `REVIEW_PASS=no`
 
 If the marker is missing, the script tries `_infer_review_pass_without_marker(...)` as a fallback by inspecting the final text for phrases like "no findings" or "issues remain".
 
@@ -249,6 +268,8 @@ That helper tells Codex to:
 - not modify files
 - return `PRE_PUSH_REVIEW_OK=yes` or `PRE_PUSH_REVIEW_OK=no`
 
+This review gate runs Codex with a read-only sandbox.
+
 If the review gate fails, the script discards generated changes with `_reset_generated_changes(pre_round_sha)` and returns `discarded`.
 
 ### Local quality gates
@@ -260,7 +281,8 @@ Before every commit/push, `_run_local_quality_gates()` runs:
 
 If both pass, the function proceeds.
 
-If either fails, the script captures the combined failure output, truncates it for logging, and enters the local quality repair flow.
+If either fails, the script captures bounded combined failure output, truncates
+it for the repair prompt/logging, and enters the local quality repair flow.
 
 ### Local quality repair rounds
 
@@ -274,6 +296,10 @@ The helper `_run_local_quality_fix_round(...)` asks Codex to:
 If Codex says `yes`, `_commit_and_push(...)` retries the local quality gates.
 
 If Codex says `no`, or if the configured local repair round limit is exhausted, the script resets generated changes back to the pre-round SHA and either returns `discarded` or raises `CommandError`.
+
+The global wall-clock deadline is checked during this repair loop, and the
+subprocess helper interrupts `just`, `codex`, `git`, and `gh` commands when the
+remaining run budget expires.
 
 ### Reset behavior for generated changes
 
@@ -321,11 +347,14 @@ For each poll cycle, it summarizes the current check buckets, such as:
 
 The result rules are:
 
-- if no checks are reported, treat the branch as green
+- if no checks are reported yet, keep polling until checks appear or the timeout expires
 - if all reported buckets are `pass` or `skipping`, treat the branch as green
 - if any check is still `pending`, keep polling
 - if checks are failing and none are pending, return failure to the CI loop
 - if polling exceeds the timeout, raise `CommandError`
+
+`gh pr checks` exit code 8 is treated as pending state, including the case
+where the command returns no JSON output yet.
 
 ## CI repair loop
 
@@ -336,7 +365,7 @@ Each round calls `_run_ci_fix_round(round_number, checks, model)`.
 That helper:
 
 1. extracts the failing or canceled checks
-2. formats a small failure summary including names, states, and links
+2. formats a small failure summary including names, states, workflows, and links
 3. asks Codex to diagnose the failures, using GitHub logs as needed
 4. asks Codex to fix the underlying issue locally
 5. asks Codex to return `CI_FIX_READY=yes` or `CI_FIX_READY=no`
@@ -423,6 +452,8 @@ A normal run may:
 - reset and clean the worktree when throwing away generated changes
 
 This is not a read-only tool. It mutates both local git state and remote GitHub state.
+Use `--dry-run` when you only want the safe PR preflight; it exits before the
+mutating worktree, git, GitHub, Codex, and merge phases.
 
 ## Operational caveats
 
@@ -430,7 +461,7 @@ A few current characteristics matter when running it:
 
 - the script assumes the dedicated PR worktree is safe to hard-reset and clean
 - `os.chdir(worktree)` is process-global and remains in effect for later helpers
-- `codex exec` failures currently raise before any partial marker output is recovered
+- `codex exec` failures are fatal even when a partial last-message exists
 - many loops are unbounded by default unless you set explicit caps
 - transient GitHub CLI failures are not retried automatically
 

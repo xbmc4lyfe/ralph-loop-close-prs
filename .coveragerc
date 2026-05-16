@@ -1,0 +1,11 @@
+[run]
+source =
+    codex_ralph_wiggum_loop
+    ralph_loop
+
+[report]
+fail_under = 90
+show_missing = True
+exclude_also =
+    if sys.version_info <
+    if __name__ == "__main__":

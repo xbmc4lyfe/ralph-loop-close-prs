@@ -12,12 +12,18 @@ WORKTREE_ROOT="${RALPH_RANDOM_WORKTREE_ROOT:-$LOG_DIR/worktrees}"
 ITERATION_SECONDS="${RALPH_RANDOM_SECONDS:-60}"
 SLEEP_SECONDS="${RALPH_RANDOM_SLEEP_SECONDS:-5}"
 ERROR_SLEEP_SECONDS="${RALPH_RANDOM_ERROR_SLEEP_SECONDS:-30}"
+USAGE_LIMIT_SLEEP_SECONDS="${RALPH_RANDOM_USAGE_LIMIT_SLEEP_SECONDS:-1800}"
+STOP_GRACE_SECONDS="${RALPH_RANDOM_STOP_GRACE_SECONDS:-15}"
 MAX_DEPTH="${RALPH_RANDOM_MAX_DEPTH:-4}"
 MODEL="${RALPH_RANDOM_MODEL:-gpt-5.5}"
 REASONING_EFFORT="${RALPH_RANDOM_REASONING_EFFORT:-medium}"
 SERVICE_TIER="${RALPH_RANDOM_SERVICE_TIER:-}"
 INCLUDE_SELF="${RALPH_RANDOM_INCLUDE_SELF:-0}"
 AGENT_ID="${RALPH_RANDOM_AGENT_ID:-agent-$$}"
+ACTIVE_SOURCE_REPO=""
+ACTIVE_WORKTREE=""
+ACTIVE_LOG_FILE=""
+ACTIVE_CHILD_PID=""
 
 mkdir -p "$LOG_DIR"
 
@@ -58,6 +64,7 @@ release_run_lock() {
 cleanup_run() {
     local rc=$?
     local pid
+    cleanup_active_iteration
     pid="$(cat "$PID_FILE" 2>/dev/null || true)"
     if [[ "$pid" == "$$" && "$rc" -ne 0 && "$rc" -ne 130 && "$rc" -ne 143 ]]; then
         echo "[$(date)] runner exiting unexpectedly rc=${rc}" >> "$OUT_FILE"
@@ -66,6 +73,54 @@ cleanup_run() {
         rm -f "$PID_FILE"
     fi
     release_run_lock
+}
+
+cleanup_active_iteration() {
+    cleanup_active_child
+    if [[ -z "$ACTIVE_SOURCE_REPO" || -z "$ACTIVE_WORKTREE" || -z "$ACTIVE_LOG_FILE" ]]; then
+        return 0
+    fi
+    if [[ ! -d "$ACTIVE_WORKTREE" ]]; then
+        ACTIVE_SOURCE_REPO=""
+        ACTIVE_WORKTREE=""
+        ACTIVE_LOG_FILE=""
+        return 0
+    fi
+    {
+        echo
+        echo "Cleaning active iteration worktree after runner shutdown."
+        echo "source_repo=${ACTIVE_SOURCE_REPO}"
+        echo "worktree=${ACTIVE_WORKTREE}"
+    } >> "$ACTIVE_LOG_FILE"
+    kill_worktree_processes "$ACTIVE_WORKTREE" "$ACTIVE_LOG_FILE" || true
+    remove_worktree "$ACTIVE_SOURCE_REPO" "$ACTIVE_WORKTREE" "$ACTIVE_LOG_FILE" || true
+    ACTIVE_SOURCE_REPO=""
+    ACTIVE_WORKTREE=""
+    ACTIVE_LOG_FILE=""
+}
+
+cleanup_active_child() {
+    if [[ -z "$ACTIVE_CHILD_PID" ]]; then
+        return 0
+    fi
+    kill_descendants "$ACTIVE_CHILD_PID" || true
+    ACTIVE_CHILD_PID=""
+}
+
+clear_active_iteration() {
+    ACTIVE_CHILD_PID=""
+    ACTIVE_SOURCE_REPO=""
+    ACTIVE_WORKTREE=""
+    ACTIVE_LOG_FILE=""
+}
+
+run_interruptible() {
+    "$@" &
+    ACTIVE_CHILD_PID="$!"
+    wait "$ACTIVE_CHILD_PID"
+    local rc=$?
+    ACTIVE_CHILD_PID=""
+    return "$rc"
 }
 
 acquire_run_lock() {
@@ -97,6 +152,36 @@ kill_descendants() {
     kill "$parent" 2>/dev/null || true
 }
 
+wait_for_pid_exit() {
+    local pid="$1"
+    local seconds="$2"
+    python3 - "$pid" "$seconds" <<'PY'
+import os
+import sys
+import time
+
+pid = int(sys.argv[1])
+deadline = time.monotonic() + float(sys.argv[2])
+
+while time.monotonic() < deadline:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        sys.exit(0)
+    except PermissionError:
+        pass
+    time.sleep(0.2)
+
+try:
+    os.kill(pid, 0)
+except ProcessLookupError:
+    sys.exit(0)
+except PermissionError:
+    pass
+sys.exit(1)
+PY
+}
+
 safe_name() {
     python3 - "$1" <<'PY'
 import hashlib
@@ -126,6 +211,88 @@ PY
 repo_is_clean() {
     local repo="$1"
     [[ -z "$(git -C "$repo" status --porcelain --untracked-files=all 2>/dev/null)" ]]
+}
+
+codex_usage_limited() {
+    local log_file="$1"
+    grep -Eiq 'usage limit|purchase more credits|try again at' "$log_file" 2>/dev/null
+}
+
+monotonic_millis() {
+    python3 - <<'PY'
+import time
+
+print(int(time.monotonic() * 1000))
+PY
+}
+
+remaining_iteration_seconds() {
+    local started_ms="$1"
+    python3 - "$started_ms" "$ITERATION_SECONDS" <<'PY'
+import sys
+import time
+
+started_ms = int(sys.argv[1])
+budget_ms = int(float(sys.argv[2]) * 1000)
+elapsed_ms = int(time.monotonic() * 1000) - started_ms
+remaining_ms = max(0, budget_ms - elapsed_ms)
+print("{:.3f}".format(remaining_ms / 1000.0))
+PY
+}
+
+has_remaining_time() {
+    python3 - "$1" <<'PY'
+import sys
+
+sys.exit(0 if float(sys.argv[1]) > 0 else 1)
+PY
+}
+
+run_setup_with_timeout() {
+    local seconds="$1"
+    local log_file="$2"
+    shift 2
+    python3 - "$seconds" "$log_file" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+seconds = float(sys.argv[1])
+log_file = sys.argv[2]
+cmd = sys.argv[3:]
+
+if seconds <= 0:
+    sys.exit(124)
+
+with open(log_file, "a", encoding="utf-8") as log:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        sys.exit(proc.wait(timeout=seconds))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (LookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (LookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        sys.exit(124)
+PY
 }
 
 remove_worktree() {
@@ -232,70 +399,105 @@ max_depth = int(sys.argv[2])
 script_dir = os.path.realpath(os.path.abspath(os.path.expanduser(sys.argv[3])))
 worktree_root = os.path.realpath(os.path.abspath(os.path.expanduser(sys.argv[4])))
 include_self = sys.argv[5] == "1"
-repos = []
+node_budget = int(os.environ.get("RALPH_RANDOM_PICKER_NODE_BUDGET", "500"))
+candidate_limit = int(os.environ.get("RALPH_RANDOM_PICKER_CANDIDATE_LIMIT", "64"))
 skip_roots = [worktree_root]
 if not include_self:
     skip_roots.append(script_dir)
+prune_names = {
+    ".cache",
+    ".codex",
+    ".git",
+    ".ralph-logs",
+    ".venv",
+    ".worktrees",
+    "__pycache__",
+    "node_modules",
+    "target",
+}
 
-for current, dirs, files in os.walk(root):
-    real_current = os.path.realpath(current)
-    if any(real_current == skip or real_current.startswith(skip + os.sep) for skip in skip_roots):
-        dirs[:] = []
+
+def should_skip(path):
+    real_path = os.path.realpath(path)
+    return any(real_path == skip or real_path.startswith(skip + os.sep) for skip in skip_roots)
+
+
+def depth_for(path):
+    rel = os.path.relpath(path, root)
+    return 0 if rel == "." else rel.count(os.sep) + 1
+
+
+stack = [root]
+visited = 0
+candidates = []
+while stack and visited < node_budget and len(candidates) < candidate_limit:
+    index = random.randrange(len(stack))
+    current = stack.pop(index)
+    visited += 1
+    if should_skip(current):
         continue
-    rel = os.path.relpath(current, root)
-    depth = 0 if rel == "." else rel.count(os.sep) + 1
-    has_git = ".git" in dirs or ".git" in files
-    dirs[:] = [
-        d for d in dirs
-        if d not in {
-            ".cache",
-            ".codex",
-            ".git",
-            ".ralph-logs",
-            ".venv",
-            ".worktrees",
-            "__pycache__",
-            "node_modules",
-            "target",
-        }
-    ]
+    depth = depth_for(current)
     if depth > max_depth:
-        dirs[:] = []
         continue
-    if has_git:
-        check = subprocess.run(
-            ["git", "-C", current, "rev-parse", "--is-inside-work-tree"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if check.returncode == 0:
-            repos.append(current)
-        dirs[:] = []
 
-if not repos:
-    sys.exit(1)
-print(random.choice(repos))
+    try:
+        entries = os.listdir(current)
+    except OSError:
+        continue
+
+    if ".git" in entries:
+        candidates.append(current)
+        continue
+
+    if depth == max_depth:
+        continue
+
+    children = []
+    for name in entries:
+        if name in prune_names:
+            continue
+        path = os.path.join(current, name)
+        if os.path.isdir(path):
+            children.append(path)
+    random.shuffle(children)
+    stack.extend(children)
+
+random.shuffle(candidates)
+for current in candidates:
+    check = subprocess.run(
+        ["git", "-C", current, "rev-parse", "--is-inside-work-tree"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if check.returncode == 0:
+        print(current)
+        sys.exit(0)
+
+sys.exit(1)
 PY
 }
 
 run_codex_with_timeout() {
-    local repo="$1"
-    local context_file="$2"
-    local last_message="$3"
-    python3 - "$ITERATION_SECONDS" "$repo" "$context_file" "$last_message" "$MODEL" "$REASONING_EFFORT" "$SERVICE_TIER" <<'PY'
+    local seconds="$1"
+    local repo="$2"
+    local context_file="$3"
+    local last_message="$4"
+    local log_file="$5"
+    python3 - "$seconds" "$repo" "$context_file" "$last_message" "$log_file" "$MODEL" "$REASONING_EFFORT" "$SERVICE_TIER" <<'PY'
 import os
 import signal
 import subprocess
 import sys
+import threading
 
-seconds = int(sys.argv[1])
+seconds = float(sys.argv[1])
 repo = sys.argv[2]
 context_file = sys.argv[3]
 last_message = sys.argv[4]
-model = sys.argv[5]
-reasoning_effort = sys.argv[6]
-service_tier = sys.argv[7]
-stdout = ""
+log_file = sys.argv[5]
+model = sys.argv[6]
+reasoning_effort = sys.argv[7]
+service_tier = sys.argv[8]
 
 cmd = [
     "codex",
@@ -328,6 +530,18 @@ with open(context_file, "r", encoding="utf-8") as prompt:
         text=True,
         start_new_session=True,
     )
+
+def copy_output():
+    assert proc.stdout is not None
+    with open(log_file, "a", encoding="utf-8") as log:
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                break
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            log.write(chunk)
+            log.flush()
 
 def matching_repo_pids():
     needles = {
@@ -374,25 +588,32 @@ def kill_codex_group(sig):
     except (LookupError, PermissionError):
         pass
 
+reader = threading.Thread(target=copy_output, daemon=True)
+reader.start()
+
 try:
-    stdout, _ = proc.communicate(timeout=seconds)
+    proc.wait(timeout=seconds)
 except subprocess.TimeoutExpired:
     kill_codex_group(signal.SIGTERM)
     kill_repo_processes(signal.SIGTERM)
     try:
-        stdout, _ = proc.communicate(timeout=1)
+        proc.wait(timeout=1)
     except subprocess.TimeoutExpired:
         kill_repo_processes(signal.SIGKILL)
         kill_codex_group(signal.SIGKILL)
         try:
-            stdout, _ = proc.communicate(timeout=1)
+            proc.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            stdout = ""
-    sys.stdout.write(stdout or "")
-    sys.stdout.write(f"\nRALPH_RANDOM_TIMEOUT after {seconds}s\n")
+            pass
+    reader.join(timeout=1)
+    message = f"\nRALPH_RANDOM_TIMEOUT after {seconds:.3f}s\n"
+    sys.stdout.write(message)
+    sys.stdout.flush()
+    with open(log_file, "a", encoding="utf-8") as log:
+        log.write(message)
     sys.exit(124)
 
-sys.stdout.write(stdout or "")
+reader.join(timeout=1)
 sys.exit(proc.returncode)
 PY
 }
@@ -437,9 +658,11 @@ run_loop() {
     agent_token="$(safe_token "$AGENT_ID")"
     while true; do
         iteration=$((iteration + 1))
-        local stamp source_repo safe log_file last_message context_file worktree branch_name pre_head post_head status_after rc
+        local stamp iteration_started source_repo safe log_file last_message context_file worktree branch_name pre_head post_head status_after rc setup_remaining codex_remaining
         stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+        iteration_started="$(monotonic_millis)"
 
+        echo "[$(date)] selecting_repo iteration=${iteration} root=${SEARCH_ROOT}" | tee -a "$OUT_FILE"
         if ! source_repo="$(pick_repo)"; then
             echo "[$(date)] no git repos found under $SEARCH_ROOT; sleeping ${ERROR_SLEEP_SECONDS}s" | tee -a "$OUT_FILE"
             sleep "$ERROR_SLEEP_SECONDS"
@@ -482,20 +705,47 @@ run_loop() {
             continue
         fi
 
-        if ! git -C "$source_repo" worktree add --detach "$worktree" "$pre_head" >> "$log_file" 2>&1; then
+        ACTIVE_SOURCE_REPO="$source_repo"
+        ACTIVE_WORKTREE="$worktree"
+        ACTIVE_LOG_FILE="$log_file"
+
+        setup_remaining="$(remaining_iteration_seconds "$iteration_started")"
+        set +e
+        run_interruptible run_setup_with_timeout "$setup_remaining" "$log_file" git -C "$source_repo" worktree add --detach "$worktree" "$pre_head"
+        rc=$?
+        set -e
+        if [[ "$rc" -ne 0 ]]; then
+            if [[ "$rc" -eq 124 ]]; then
+                echo "Iteration setup timed out after ${ITERATION_SECONDS}s: $source_repo" | tee -a "$log_file"
+                remove_worktree "$source_repo" "$worktree" "$log_file"
+                clear_active_iteration
+                sleep "$SLEEP_SECONDS"
+                continue
+            fi
             {
                 echo "Could not create isolated worktree for $source_repo"
                 tail -80 "$log_file"
             } | tee -a "$log_file"
+            remove_worktree "$source_repo" "$worktree" "$log_file"
+            clear_active_iteration
             sleep "$SLEEP_SECONDS"
             continue
         fi
 
         write_context "$worktree" "$source_repo" "$branch_name" "$iteration" "$stamp" "$context_file"
 
+        codex_remaining="$(remaining_iteration_seconds "$iteration_started")"
+        if ! has_remaining_time "$codex_remaining"; then
+            echo "Iteration setup timed out after ${ITERATION_SECONDS}s: $source_repo" | tee -a "$log_file"
+            remove_worktree "$source_repo" "$worktree" "$log_file"
+            clear_active_iteration
+            sleep "$SLEEP_SECONDS"
+            continue
+        fi
+
         set +e
-        run_codex_with_timeout "$worktree" "$context_file" "$last_message" 2>&1 | tee -a "$log_file"
-        rc=${PIPESTATUS[0]}
+        run_interruptible run_codex_with_timeout "$codex_remaining" "$worktree" "$context_file" "$last_message" "$log_file"
+        rc=$?
         set -e
         kill_worktree_processes "$worktree" "$log_file"
 
@@ -507,6 +757,7 @@ run_loop() {
                 echo "worktree=${worktree}"
             } | tee -a "$log_file"
             remove_worktree "$source_repo" "$worktree" "$log_file"
+            clear_active_iteration
             sleep "$SLEEP_SECONDS"
             continue
         fi
@@ -537,15 +788,29 @@ run_loop() {
                 git -C "$worktree" log -1 --oneline
             } | tee -a "$log_file"
             remove_worktree "$source_repo" "$worktree" "$log_file"
+            clear_active_iteration
         elif [[ "$rc" -eq 124 ]]; then
-            echo "Iteration timed out with no committed change: $source_repo" | tee -a "$log_file"
+            echo "Iteration timed out with no committed change: $source_repo" | tee -a "$OUT_FILE" "$log_file"
             remove_worktree "$source_repo" "$worktree" "$log_file"
+            clear_active_iteration
         elif [[ "$rc" -ne 0 ]]; then
+            if codex_usage_limited "$log_file"; then
+                {
+                    echo "codex_usage_limited iteration=${iteration}; sleeping ${USAGE_LIMIT_SLEEP_SECONDS}s"
+                    echo "source_repo=${source_repo}"
+                } | tee -a "$OUT_FILE" "$log_file"
+                remove_worktree "$source_repo" "$worktree" "$log_file"
+                clear_active_iteration
+                sleep "$USAGE_LIMIT_SLEEP_SECONDS"
+                continue
+            fi
             echo "Iteration exited rc=${rc} with no committed change: $source_repo" | tee -a "$log_file"
             remove_worktree "$source_repo" "$worktree" "$log_file"
+            clear_active_iteration
         else
             echo "Iteration finished with no committed change: $source_repo" | tee -a "$log_file"
             remove_worktree "$source_repo" "$worktree" "$log_file"
+            clear_active_iteration
         fi
 
         sleep "$SLEEP_SECONDS"
@@ -596,7 +861,14 @@ case "${1:-start}" in
     stop)
         if is_running; then
             pid="$(current_runner_pid)"
-            kill_descendants "$pid"
+            kill "$pid" 2>/dev/null || true
+            if ! wait_for_pid_exit "$pid" "$STOP_GRACE_SECONDS"; then
+                echo "runner did not exit within ${STOP_GRACE_SECONDS}s; killing descendants" >&2
+            fi
+            if pid_is_live "$pid"; then
+                kill_descendants "$pid"
+            fi
+            wait_for_pid_exit "$pid" 2>/dev/null || true
             rm -f "$PID_FILE"
             rm -rf "$LOCK_DIR"
             echo "stopped $pid"
