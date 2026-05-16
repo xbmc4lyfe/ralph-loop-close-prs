@@ -139,6 +139,15 @@ def _parse_args() -> argparse.Namespace:
             "(the default)."
         ),
     )
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=None,
+        help=(
+            "Target repository directory to run against. Defaults to the "
+            "current working directory."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -215,6 +224,15 @@ def _run_dry_run(args: argparse.Namespace) -> int:
 def main() -> int:
     original_cwd = os.getcwd()
     args = _parse_args()
+    if args.directory is not None:
+        target_dir = os.path.abspath(os.path.expanduser(args.directory))
+        if not os.path.isdir(target_dir):
+            raise CommandError(
+                "Target directory does not exist or is not a directory: {}".format(
+                    args.directory
+                )
+            )
+        os.chdir(target_dir)
     start_time = time.monotonic()
     deadline: Optional[float] = (
         start_time + args.max_wall_clock_seconds

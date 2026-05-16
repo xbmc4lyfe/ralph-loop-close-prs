@@ -226,19 +226,31 @@ def _ensure_pr_worktree(
     )
     start_ref = _fetch_pr_branch_or_head(pr_number=pr_number, branch=branch)
     existing_branch_worktree = _worktree_for_branch(branch)
-    if existing_branch_worktree and os.path.abspath(
-        existing_branch_worktree
-    ) != os.path.abspath(path):
-        sys.stdout.write("{}\n".format(LOOP_ALREADY_RUNNING_MESSAGE))
-        sys.stdout.flush()
-        _print_step(
-            "PR branch '{}' is already checked out at {}; refusing to run outside {}".format(
-                branch,
-                existing_branch_worktree,
-                path,
+    if existing_branch_worktree:
+        existing_abs = os.path.abspath(existing_branch_worktree)
+        cwd_abs = os.path.abspath(os.getcwd())
+        desired_abs = os.path.abspath(path)
+        if existing_abs == cwd_abs and existing_abs != desired_abs:
+            _print_step(
+                "PR branch '{}' is already checked out at the target directory {}; "
+                "operating in place rather than creating a separate worktree.".format(
+                    branch, existing_abs
+                )
             )
-        )
-        raise SystemExit(0)
+            _ensure_worktree_origin_matches(existing_abs)
+            _sync_existing_worktree(path=existing_abs, start_ref=start_ref)
+            return existing_abs
+        if existing_abs != desired_abs:
+            sys.stdout.write("{}\n".format(LOOP_ALREADY_RUNNING_MESSAGE))
+            sys.stdout.flush()
+            _print_step(
+                "PR branch '{}' is already checked out at {}; refusing to run outside {}".format(
+                    branch,
+                    existing_branch_worktree,
+                    path,
+                )
+            )
+            raise SystemExit(0)
     if os.path.isdir(path):
         _print_step("Using existing PR worktree {}".format(path))
         if not _worktree_path_is_registered(path):

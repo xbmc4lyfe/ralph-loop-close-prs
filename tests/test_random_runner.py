@@ -826,3 +826,72 @@ sleep 30
         time.sleep(0.1)
 
     assert not worktree.exists()
+
+
+def test_many_launcher_rejects_count_above_hard_cap():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "run-ralph-random-repos-many.sh"
+
+    result = subprocess.run(
+        [str(script), "10000"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "refusing to launch 10000 workers" in result.stderr
+    assert "maximum is 50" in result.stderr
+
+
+def test_many_launcher_starts_requested_worker_count(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "run-ralph-random-repos-many.sh"
+    fake_worker = tmp_path / "worker.sh"
+    call_log = tmp_path / "calls.log"
+    multi_log_dir = tmp_path / "multi"
+
+    _write_executable(
+        fake_worker,
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s|%s|%s\\n' "${RALPH_RANDOM_AGENT_ID}" "${RALPH_RANDOM_LOG_DIR}" "$*" >> "${RALPH_TEST_CALL_LOG}"
+case "${1:-}" in
+  start)
+    echo "started ${RALPH_RANDOM_AGENT_ID}"
+    ;;
+  status)
+    echo "status ${RALPH_RANDOM_AGENT_ID}"
+    ;;
+  stop)
+    echo "stopped ${RALPH_RANDOM_AGENT_ID}"
+    ;;
+esac
+""",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "RALPH_RANDOM_WORKER_SCRIPT": str(fake_worker),
+            "RALPH_RANDOM_MULTI_LOG_DIR": str(multi_log_dir),
+            "RALPH_RANDOM_AGENT_ID": "batch",
+            "RALPH_TEST_CALL_LOG": str(call_log),
+        }
+    )
+
+    result = _run(
+        [str(script), "3"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert "worker 0001: started batch-0001" in result.stdout
+    assert "worker 0002: started batch-0002" in result.stdout
+    assert "worker 0003: started batch-0003" in result.stdout
+    assert call_log.read_text().splitlines() == [
+        "batch-0001|{}|start".format(multi_log_dir / "worker-0001"),
+        "batch-0002|{}|start".format(multi_log_dir / "worker-0002"),
+        "batch-0003|{}|start".format(multi_log_dir / "worker-0003"),
+    ]
