@@ -55,6 +55,7 @@ def _gh_run_with_retry(
             cmd,
             check=False,
             capture_output=capture_output,
+            replay_output=False,
             max_output_bytes=None if capture_output else None,
         )
         last_completed = completed

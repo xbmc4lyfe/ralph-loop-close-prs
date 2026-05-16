@@ -120,6 +120,31 @@ def test_run_command_disconnects_inherited_stdin(monkeypatch, spy, completed_pro
     assert run.call_args.kwargs["stdin"] == subprocess.DEVNULL
 
 
+def test_run_command_can_pass_captured_stdin(monkeypatch, spy, completed_process):
+    def fake_run(_cmd, **kwargs):
+        assert kwargs["stdin"] is None
+        assert kwargs["input"] == b"prompt body"
+        return completed_process()
+
+    run = spy(side_effect=fake_run)
+    monkeypatch.setattr(process.subprocess, "run", run)
+
+    process._run_command(["cmd"], capture_output=True, input_text="prompt body")
+
+
+def test_run_command_can_pass_uncaptured_stdin(monkeypatch, spy, completed_process):
+    def fake_run(_cmd, **kwargs):
+        assert kwargs["stdin"] is None
+        assert kwargs["input"] == "prompt body"
+        assert kwargs["text"] is True
+        return completed_process()
+
+    run = spy(side_effect=fake_run)
+    monkeypatch.setattr(process.subprocess, "run", run)
+
+    process._run_command(["cmd"], capture_output=False, input_text="prompt body")
+
+
 def test_run_command_logs_redacted_command_when_supplied(
     monkeypatch, capsys, spy, completed_process
 ):
@@ -135,6 +160,29 @@ def test_run_command_logs_redacted_command_when_supplied(
     stderr = capsys.readouterr().err
     assert "<codex prompt>" in stderr
     assert "secret-token" not in stderr
+
+
+def test_run_command_can_suppress_command_logging(
+    monkeypatch, capsys, spy, completed_process
+):
+    def fake_run(_cmd, **kwargs):
+        kwargs["stdout"].write(b"private json\n")
+        return completed_process(stdout=None)
+
+    run = spy(side_effect=fake_run)
+    monkeypatch.setattr(process.subprocess, "run", run)
+
+    result = process._run_command(
+        ["gh", "api", "secret"],
+        capture_output=True,
+        replay_output=False,
+        log_cmd=[],
+    )
+
+    captured = capsys.readouterr()
+    assert result.stdout == "private json\n"
+    assert "gh api secret" not in captured.err
+    assert "private json" not in captured.out
 
 
 def test_run_command_interrupts_commands_when_wall_clock_deadline_expires(monkeypatch):

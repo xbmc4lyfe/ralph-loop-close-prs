@@ -85,13 +85,23 @@ def _run_command(
     check: bool = True,
     capture_output: bool = True,
     cwd: Optional[str] = None,
+    input_text: Optional[str] = None,
     replay_output: bool = True,
     log_cmd: Optional[Sequence[str]] = None,
     max_output_bytes=_DEFAULT_OUTPUT_LIMIT,
 ) -> subprocess.CompletedProcess:
-    printable = _printable_cmd(log_cmd or cmd)
-    sys.stderr.write("$ {}\n".format(printable))
-    sys.stderr.flush()
+    printable = _printable_cmd(cmd)
+    if log_cmd is None:
+        logged = printable
+    elif len(log_cmd) == 0:
+        logged = ""
+        printable = "<command redacted>"
+    else:
+        logged = _printable_cmd(log_cmd)
+        printable = logged
+    if logged:
+        sys.stderr.write("$ {}\n".format(logged))
+        sys.stderr.flush()
     timeout = _remaining_command_timeout(printable)
     output_limit = (
         MAX_CAPTURED_STREAM_BYTES
@@ -108,7 +118,8 @@ def _run_command(
                     cwd=cwd,
                     stdout=stdout_spool,
                     stderr=stderr_spool,
-                    stdin=subprocess.DEVNULL,
+                    input=input_text.encode("utf-8") if input_text is not None else None,
+                    stdin=subprocess.DEVNULL if input_text is None else None,
                     check=False,
                     timeout=timeout,
                 )
@@ -144,7 +155,8 @@ def _run_command(
             completed = subprocess.run(  # nosec B603
                 list(cmd),
                 cwd=cwd,
-                stdin=subprocess.DEVNULL,
+                input=input_text,
+                stdin=subprocess.DEVNULL if input_text is None else None,
                 text=True,
                 check=False,
                 timeout=timeout,

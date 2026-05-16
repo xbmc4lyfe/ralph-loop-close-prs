@@ -57,6 +57,7 @@ def test_gh_run_with_retry_uses_unbounded_capture_and_deadline_aware_sleep(
     )
 
     assert run.call_args_list[0].kwargs["max_output_bytes"] is None
+    assert run.call_args_list[0].kwargs["replay_output"] is False
     sleep.assert_called_once_with(0.1, "gh retry backoff")
 
 

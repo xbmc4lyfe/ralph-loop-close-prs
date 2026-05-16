@@ -131,10 +131,10 @@ def test_review_pass_inference_handles_pass_fail_and_ambiguous_language(
 def test_codex_exec_reads_last_message_and_passes_model_and_sandbox(
     monkeypatch, completed_process
 ):
-    seen_commands = []
+    seen_calls = []
 
-    def fake_run(cmd, check, capture_output):
-        seen_commands.append(cmd)
+    def fake_run(cmd, check, capture_output, **kwargs):
+        seen_calls.append((cmd, kwargs))
         output_path = cmd[cmd.index("-o") + 1]
         with open(output_path, "w", encoding="utf-8") as handle:
             handle.write("REVIEW_PASS=yes\n")
@@ -151,9 +151,13 @@ def test_codex_exec_reads_last_message_and_passes_model_and_sandbox(
 
     assert marker is True
     assert message == "REVIEW_PASS=yes"
-    assert "--model" in seen_commands[0]
-    assert "gpt-test" in seen_commands[0]
-    assert "read-only" in seen_commands[0]
+    assert "--model" in seen_calls[0][0]
+    assert "gpt-test" in seen_calls[0][0]
+    assert "read-only" in seen_calls[0][0]
+    assert seen_calls[0][0][-1] == "-"
+    assert seen_calls[0][1]["input_text"] == "prompt"
+    assert seen_calls[0][1]["log_cmd"][-1] == "<codex prompt on stdin>"
+    assert "prompt" not in seen_calls[0][1]["log_cmd"]
 
 
 def test_codex_exec_reads_last_message_with_size_bound(
@@ -199,7 +203,7 @@ def test_codex_exec_raises_when_failed_run_has_no_last_message(
 def test_codex_exec_raises_when_failed_run_has_partial_last_message(
     monkeypatch, completed_process
 ):
-    def fake_run(cmd, check, capture_output):
+    def fake_run(cmd, check, capture_output, **_kwargs):
         output_path = cmd[cmd.index("-o") + 1]
         with open(output_path, "w", encoding="utf-8") as handle:
             handle.write("REVIEW_PASS=no\n")
@@ -231,6 +235,8 @@ def test_codex_exec_raises_when_failed_run_has_partial_last_message(
         "Reconnecting... 5/5",
         "reconnecting... 5 / 5 then giving up",
         "codex exec failed (exit=1) with no partial last-message captured.",
+        "/bin/zsh:1: no such file or directory: /review",
+        "exec: /bin/bash -lc /review exited 127",
     ],
 )
 def test_detect_codex_env_failure_matches_known_patterns(text):
@@ -261,7 +267,7 @@ def test_detect_codex_env_failure_handles_none_arguments():
 def test_codex_exec_raises_env_error_when_stderr_shows_401(
     monkeypatch, completed_process
 ):
-    def fake_run(cmd, check, capture_output):
+    def fake_run(cmd, check, capture_output, **_kwargs):
         return completed_process(
             returncode=1,
             stderr=(
@@ -287,7 +293,7 @@ def test_codex_exec_raises_env_error_when_stderr_shows_401(
 def test_codex_exec_raises_env_error_when_reconnect_exhausted(
     monkeypatch, completed_process
 ):
-    def fake_run(cmd, check, capture_output):
+    def fake_run(cmd, check, capture_output, **_kwargs):
         return completed_process(
             returncode=1,
             stderr="Reconnecting... 1/5\nReconnecting... 5/5\n",
