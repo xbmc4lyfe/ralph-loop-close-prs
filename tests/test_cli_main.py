@@ -453,17 +453,20 @@ def test_fan_out_all_prs_spawns_one_subprocess_per_pr_and_returns_zero(
 ):
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [107, 105, 99])
     spawned = []
+    captured_kwargs = []
 
     def fake_popen(cmd, *a, **kw):
         spawned.append(cmd)
+        captured_kwargs.append(kw)
         return _FakeProc(0)
 
     monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
     script_path = str(tmp_path / "script.py")
     (tmp_path / "script.py").write_text("# stub\n")
+    log_dir = tmp_path / "fan-out-logs"
 
     rc = cli._fan_out_all_prs(
-        cli_args(all_prs=True),
+        cli_args(all_prs=True, fan_out_log_dir=str(log_dir)),
         ["./script.py", "--all-prs", "--base", "main"],
         script_path,
     )
@@ -475,6 +478,13 @@ def test_fan_out_all_prs_spawns_one_subprocess_per_pr_and_returns_zero(
         assert cmd[1] == script_path
         assert "--all-prs" not in cmd
         assert cmd[-2:] == ["--pr", str(expected_pr)]
+    for kw in captured_kwargs:
+        assert kw["stdin"] is subprocess.DEVNULL
+        assert kw["stderr"] is subprocess.STDOUT
+        assert hasattr(kw["stdout"], "write")
+    assert log_dir.is_dir()
+    for pr in [107, 105, 99]:
+        assert (log_dir / "pr-{}.log".format(pr)).exists()
 
 
 def test_fan_out_all_prs_returns_one_when_any_child_fails(

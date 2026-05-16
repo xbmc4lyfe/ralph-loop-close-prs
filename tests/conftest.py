@@ -43,6 +43,7 @@ def make_args(**overrides):
         "max_wall_clock_seconds": 0,
         "directory": None,
         "all_prs": False,
+        "fan_out_log_dir": None,
     }
     values.update(overrides)
     return argparse.Namespace(**values)

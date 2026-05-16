@@ -157,6 +157,14 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fan-out-log-dir",
+        default=None,
+        help=(
+            "Directory to write per-PR fan-out logs into. Defaults to "
+            "'.ralph-logs/fan-out' under the current working directory."
+        ),
+    )
+    parser.add_argument(
         "directory",
         nargs="?",
         default=None,
@@ -271,26 +279,52 @@ def _fan_out_all_prs(
             "No open non-draft PRs found targeting base '{}'.".format(args.base)
         )
         return 0
+    log_root = os.path.abspath(
+        os.path.expanduser(args.fan_out_log_dir or ".ralph-logs/fan-out")
+    )
+    os.makedirs(log_root, exist_ok=True)
     _print_step(
-        "Fan-out: launching ralph loops for {} open PR(s): {}".format(
-            len(pr_numbers), ", ".join("#" + str(n) for n in pr_numbers)
+        "Fan-out: launching ralph loops for {} open PR(s): {} (logs in {})".format(
+            len(pr_numbers),
+            ", ".join("#" + str(n) for n in pr_numbers),
+            log_root,
         )
     )
     base_child_args = _passthrough_args(argv)
-    procs: List[Tuple[int, subprocess.Popen]] = []
+    procs: List[Tuple[int, subprocess.Popen, str, Any]] = []
     for pr in pr_numbers:
         cmd = [sys.executable, script_path] + base_child_args + ["--pr", str(pr)]
-        _print_step("Launching PR #{}: {}".format(pr, shlex.join(cmd)))
-        proc = subprocess.Popen(cmd)
-        procs.append((pr, proc))
+        log_path = os.path.join(log_root, "pr-{}.log".format(pr))
+        log_handle = open(log_path, "ab", buffering=0)
+        _print_step("Launching PR #{} (log: {})".format(pr, log_path))
+        log_handle.write(
+            "$ {}\n".format(shlex.join(cmd)).encode("utf-8", errors="replace")
+        )
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        procs.append((pr, proc, log_path, log_handle))
     failures: List[Tuple[int, int]] = []
-    for pr, proc in procs:
+    for pr, proc, log_path, log_handle in procs:
         rc = proc.wait()
+        try:
+            log_handle.close()
+        except OSError:
+            pass
         if rc != 0:
             failures.append((pr, rc))
-            _print_step("PR #{} loop exited with code {}".format(pr, rc))
+            _print_step(
+                "PR #{} loop exited with code {} (log: {})".format(
+                    pr, rc, log_path
+                )
+            )
         else:
-            _print_step("PR #{} loop completed successfully".format(pr))
+            _print_step(
+                "PR #{} loop completed successfully (log: {})".format(pr, log_path)
+            )
     if failures:
         _print_step(
             "{} of {} PR loops failed: {}".format(
