@@ -35,7 +35,11 @@ from .identity import _ensure_runtime_identity, _validate_identity_and_signing
 from .process import _print_step, _set_command_deadline
 from .quality import _commit_and_push
 from .runtime import _check_wall_clock, _round_numbers
-from .worktrees import _acquire_loop_lock, _ensure_pr_worktree
+from .worktrees import (
+    _acquire_loop_lock,
+    _cleanup_stale_loop_state,
+    _ensure_pr_worktree,
+)
 
 def _nonneg_int(value: str) -> int:
     try:
@@ -361,6 +365,12 @@ def _fan_out_all_prs(
     args: argparse.Namespace, argv: List[str], script_path: str
 ) -> int:
     pr_numbers = _list_open_prs(args.base)
+    try:
+        _cleanup_stale_loop_state(args.worktree_root, set(pr_numbers))
+    except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
+        _print_step(
+            "Stale-state cleanup failed before fan-out (continuing): {}".format(exc)
+        )
     if not pr_numbers:
         _print_step(
             "No open non-draft PRs found targeting base '{}'.".format(args.base)

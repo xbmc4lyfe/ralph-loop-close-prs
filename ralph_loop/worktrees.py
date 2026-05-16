@@ -4,9 +4,10 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+import shutil
 import sys
 import tempfile
-from typing import Optional
+from typing import Dict, Optional, Set
 
 from .config import LOOP_ALREADY_RUNNING_MESSAGE
 from .errors import CommandError
@@ -74,6 +75,216 @@ def _acquire_loop_lock(
             pass
         raise
     return _LoopLock(handle, lock_path)
+
+
+_LOCK_FILENAME_PR_RE = re.compile(r"^codex-ralph-loop-pr-(\d+)\.lock$")
+_WORKTREE_DIR_PR_RE = re.compile(r"^pr-(\d+)-")
+
+
+def _is_path_within(child: str, parent: str) -> bool:
+    """Return True if realpath(child) is strictly inside realpath(parent)."""
+    try:
+        parent_real = os.path.realpath(parent)
+        child_real = os.path.realpath(child)
+    except OSError:
+        return False
+    if not parent_real or not child_real:
+        return False
+    parent_real = parent_real.rstrip(os.sep) + os.sep
+    if child_real == parent_real.rstrip(os.sep):
+        return False
+    return child_real.startswith(parent_real)
+
+
+def _lock_is_held_by_other_process(path: str) -> bool:
+    """Return True if another process currently holds an exclusive flock on path.
+
+    Returns False if the file does not exist, cannot be opened, or if we can
+    successfully acquire (and immediately release) an exclusive lock — the
+    latter implies no other process is currently holding it.
+    """
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _cleanup_stale_loop_state(
+    worktree_root: str, open_pr_numbers: Set[int]
+) -> Dict[str, int]:
+    """Remove lock files and worktree directories for PRs no longer open.
+
+    - Scans ``tempfile.gettempdir()`` for ``codex-ralph-loop-pr-<N>.lock``
+      files. Any whose PR number is not in ``open_pr_numbers`` is deleted,
+      unless another process currently holds an exclusive flock on it (that
+      indicates a running supervisor or loop and must not be touched).
+    - Scans ``worktree_root`` for ``pr-<N>-*`` directories. For any PR not in
+      ``open_pr_numbers``, attempts ``git worktree remove --force <path>``.
+      If git refuses or the path is not a registered worktree, falls back to
+      ``shutil.rmtree`` after verifying the path resolves under the
+      worktree_root.
+    - Refuses to touch any path outside ``tempfile.gettempdir()`` (locks) or
+      outside ``worktree_root`` (directories).
+
+    Returns a dict with keys ``locks_removed`` and ``worktrees_removed``.
+    """
+    counts = {"locks_removed": 0, "worktrees_removed": 0}
+    tmp_root = tempfile.gettempdir()
+    try:
+        tmp_entries = os.listdir(tmp_root)
+    except OSError as exc:
+        _print_step(
+            "Stale-state cleanup: could not list tempdir {}: {}".format(tmp_root, exc)
+        )
+        tmp_entries = []
+    for name in tmp_entries:
+        match = _LOCK_FILENAME_PR_RE.match(name)
+        if not match:
+            continue
+        try:
+            pr_number = int(match.group(1))
+        except ValueError:
+            continue
+        if pr_number in open_pr_numbers:
+            continue
+        lock_path = os.path.join(tmp_root, name)
+        if os.path.islink(lock_path):
+            _print_step(
+                "Stale-state cleanup: refusing to delete symlink lock {}".format(
+                    lock_path
+                )
+            )
+            continue
+        if not _is_path_within(lock_path, tmp_root):
+            _print_step(
+                "Stale-state cleanup: refusing to delete lock outside tempdir: {}".format(
+                    lock_path
+                )
+            )
+            continue
+        if _lock_is_held_by_other_process(lock_path):
+            _print_step(
+                "Stale-state cleanup: lock {} is held by another process; "
+                "leaving it in place.".format(lock_path)
+            )
+            continue
+        try:
+            os.unlink(lock_path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _print_step(
+                "Stale-state cleanup: failed to remove lock {}: {}".format(
+                    lock_path, exc
+                )
+            )
+            continue
+        counts["locks_removed"] += 1
+        _print_step(
+            "Stale-state cleanup: removed lock {} (PR #{} not open)".format(
+                lock_path, pr_number
+            )
+        )
+
+    if worktree_root and os.path.isdir(worktree_root):
+        worktree_root_real = os.path.realpath(worktree_root)
+        try:
+            wt_entries = os.listdir(worktree_root)
+        except OSError as exc:
+            _print_step(
+                "Stale-state cleanup: could not list worktree root {}: {}".format(
+                    worktree_root, exc
+                )
+            )
+            wt_entries = []
+        for name in wt_entries:
+            match = _WORKTREE_DIR_PR_RE.match(name)
+            if not match:
+                continue
+            try:
+                pr_number = int(match.group(1))
+            except ValueError:
+                continue
+            if pr_number in open_pr_numbers:
+                continue
+            entry_path = os.path.join(worktree_root, name)
+            if not _is_path_within(entry_path, worktree_root_real):
+                _print_step(
+                    "Stale-state cleanup: refusing to remove path outside "
+                    "worktree root: {}".format(entry_path)
+                )
+                continue
+            removed = False
+            try:
+                result = _run_command(
+                    ["git", "worktree", "remove", "--force", entry_path],
+                    check=False,
+                    capture_output=True,
+                )
+                if result.returncode == 0:
+                    removed = True
+                    _print_step(
+                        "Stale-state cleanup: git worktree removed {} (PR #{} "
+                        "not open)".format(entry_path, pr_number)
+                    )
+            except CommandError as exc:
+                _print_step(
+                    "Stale-state cleanup: git worktree remove failed for "
+                    "{}: {}".format(entry_path, exc)
+                )
+            if not removed and os.path.exists(entry_path):
+                # Re-verify the path is still safely inside worktree_root
+                # before fall-back rmtree (paranoia against TOCTOU).
+                if not _is_path_within(entry_path, worktree_root_real):
+                    _print_step(
+                        "Stale-state cleanup: refusing rmtree of path that no "
+                        "longer resolves under worktree root: {}".format(entry_path)
+                    )
+                    continue
+                if os.path.islink(entry_path):
+                    _print_step(
+                        "Stale-state cleanup: refusing to rmtree symlink "
+                        "{}".format(entry_path)
+                    )
+                    continue
+                try:
+                    shutil.rmtree(entry_path)
+                    removed = True
+                    _print_step(
+                        "Stale-state cleanup: rmtree fallback removed {} (PR #{} "
+                        "not open)".format(entry_path, pr_number)
+                    )
+                except OSError as exc:
+                    _print_step(
+                        "Stale-state cleanup: rmtree failed for {}: {}".format(
+                            entry_path, exc
+                        )
+                    )
+            if removed:
+                counts["worktrees_removed"] += 1
+
+    _print_step(
+        "Stale-state cleanup: removed {} lock file(s) and {} worktree "
+        "directory(ies).".format(counts["locks_removed"], counts["worktrees_removed"])
+    )
+    return counts
 
 
 def _worktree_path(*, worktree_root: str, pr_number: int, branch: str) -> str:

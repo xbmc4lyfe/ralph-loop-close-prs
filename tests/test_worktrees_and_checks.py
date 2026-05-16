@@ -388,6 +388,183 @@ def test_ensure_pr_worktree_handles_create_failures(
     assert expected_message in captured.out or expected_exception is CommandError
 
 
+def test_cleanup_stale_loop_state_removes_locks_for_closed_prs(
+    monkeypatch, tmp_path
+):
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    worktree_root = tmp_path / "wt"
+    worktree_root.mkdir()
+    monkeypatch.setattr(worktrees.tempfile, "gettempdir", lambda: str(tmp_root))
+
+    stale = tmp_root / "codex-ralph-loop-pr-101.lock"
+    stale.write_text("123\n", encoding="utf-8")
+    active = tmp_root / "codex-ralph-loop-pr-202.lock"
+    active.write_text("456\n", encoding="utf-8")
+    unrelated = tmp_root / "some-other-file.txt"
+    unrelated.write_text("keep me", encoding="utf-8")
+
+    counts = worktrees._cleanup_stale_loop_state(
+        str(worktree_root), open_pr_numbers={202}
+    )
+
+    assert counts["locks_removed"] == 1
+    assert not stale.exists()
+    assert active.exists()
+    assert unrelated.exists()
+
+
+def test_cleanup_stale_loop_state_leaves_currently_held_locks_alone(
+    monkeypatch, tmp_path
+):
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    worktree_root = tmp_path / "wt"
+    worktree_root.mkdir()
+    monkeypatch.setattr(worktrees.tempfile, "gettempdir", lambda: str(tmp_root))
+
+    held = tmp_root / "codex-ralph-loop-pr-303.lock"
+    held.write_text("999\n", encoding="utf-8")
+    fd = os.open(str(held), os.O_RDWR)
+    try:
+        import fcntl as _fcntl
+
+        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+
+        # PR 303 is *not* in open set, so normally it would be deleted, but
+        # the active flock should make cleanup skip it.
+        counts = worktrees._cleanup_stale_loop_state(
+            str(worktree_root), open_pr_numbers=set()
+        )
+    finally:
+        try:
+            import fcntl as _fcntl
+
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+    assert counts["locks_removed"] == 0
+    assert held.exists()
+
+
+def test_cleanup_stale_loop_state_respects_worktree_root_boundary(
+    monkeypatch, tmp_path
+):
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    worktree_root = tmp_path / "wt"
+    worktree_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(worktrees.tempfile, "gettempdir", lambda: str(tmp_root))
+
+    stale_dir = worktree_root / "pr-9-feature"
+    stale_dir.mkdir()
+    (stale_dir / "sentinel").write_text("x", encoding="utf-8")
+
+    sneaky_target = outside / "victim"
+    sneaky_target.mkdir()
+    (sneaky_target / "do-not-delete").write_text("keep", encoding="utf-8")
+    sneaky_link = worktree_root / "pr-99-symlink"
+    sneaky_link.symlink_to(sneaky_target)
+
+    run_calls = []
+
+    def fake_run(cmd, *_args, **_kwargs):
+        run_calls.append(cmd)
+        # Simulate git refusing because it's not a registered worktree.
+        import subprocess as _sp
+
+        return _sp.CompletedProcess(
+            args=cmd, returncode=1, stdout="", stderr="not a worktree"
+        )
+
+    monkeypatch.setattr(worktrees, "_run_command", fake_run)
+
+    counts = worktrees._cleanup_stale_loop_state(
+        str(worktree_root), open_pr_numbers=set()
+    )
+
+    # The legit stale dir should be removed via rmtree fallback.
+    assert not stale_dir.exists()
+    # The symlink-out-of-root must NOT cause us to nuke the outside victim dir.
+    assert sneaky_target.exists()
+    assert (sneaky_target / "do-not-delete").exists()
+    # Symlink entry itself either left in place or unlinked, but importantly
+    # the target outside the root is untouched.
+    assert counts["worktrees_removed"] >= 1
+
+
+def test_cleanup_stale_loop_state_uses_git_remove_when_registered(
+    monkeypatch, tmp_path
+):
+    import shutil as _shutil
+    import subprocess as _sp
+
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    worktree_root = tmp_path / "wt"
+    worktree_root.mkdir()
+    monkeypatch.setattr(worktrees.tempfile, "gettempdir", lambda: str(tmp_root))
+
+    stale_dir = worktree_root / "pr-77-feature"
+    stale_dir.mkdir()
+
+    captured = []
+
+    def fake_run(cmd, *_args, **_kwargs):
+        captured.append(cmd)
+        # Pretend git succeeded and removed the directory.
+        try:
+            _shutil.rmtree(stale_dir)
+        except FileNotFoundError:
+            pass
+        return _sp.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(worktrees, "_run_command", fake_run)
+
+    counts = worktrees._cleanup_stale_loop_state(
+        str(worktree_root), open_pr_numbers=set()
+    )
+
+    assert counts["worktrees_removed"] == 1
+    assert captured and captured[0][:3] == ["git", "worktree", "remove"]
+    assert str(stale_dir) in captured[0]
+    assert not stale_dir.exists()
+
+
+def test_cleanup_stale_loop_state_keeps_open_pr_worktrees(monkeypatch, tmp_path):
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    worktree_root = tmp_path / "wt"
+    worktree_root.mkdir()
+    monkeypatch.setattr(worktrees.tempfile, "gettempdir", lambda: str(tmp_root))
+
+    keep = worktree_root / "pr-50-still-open"
+    keep.mkdir()
+    drop = worktree_root / "pr-51-merged"
+    drop.mkdir()
+
+    def fake_run(cmd, *_args, **_kwargs):
+        import subprocess as _sp
+
+        return _sp.CompletedProcess(
+            args=cmd, returncode=1, stdout="", stderr="not registered"
+        )
+
+    monkeypatch.setattr(worktrees, "_run_command", fake_run)
+
+    counts = worktrees._cleanup_stale_loop_state(
+        str(worktree_root), open_pr_numbers={50}
+    )
+
+    assert counts["worktrees_removed"] == 1
+    assert keep.exists()
+    assert not drop.exists()
+
+
 def test_check_wall_clock_raises_after_deadline(monkeypatch):
     monkeypatch.setattr(runtime.time, "monotonic", lambda: 11)
 
