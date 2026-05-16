@@ -64,6 +64,7 @@ def _untracked_files_for_commit() -> List[str]:
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
         check=True,
         capture_output=True,
+        max_output_bytes=None,
     )
     return [path for path in (result.stdout or "").split("\0") if path]
 

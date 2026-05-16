@@ -645,7 +645,7 @@ def test_commit_and_push_stages_real_changes_without_generated_artifacts(
     dirty_values = [True, True]
     commands = []
 
-    def fake_run(cmd, check, capture_output):
+    def fake_run(cmd, check, capture_output, **_kwargs):
         commands.append(cmd)
         if cmd == ["git", "diff", "--cached", "--quiet"]:
             return completed_process(returncode=1)
@@ -696,6 +696,30 @@ def test_commit_and_push_stages_real_changes_without_generated_artifacts(
     assert ".ralph-logs/round.log" not in staged_untracked
     assert "__pycache__/module.pyc" not in staged_untracked
     assert commands[-1] == ["git", "push", "origin", "feature"]
+
+
+def test_untracked_files_for_commit_uses_unbounded_machine_output(
+    monkeypatch, completed_process
+):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return completed_process(stdout="src/fix.py\0")
+
+    monkeypatch.setattr(quality, "_run_command", fake_run)
+
+    assert quality._untracked_files_for_commit() == ["src/fix.py"]
+    assert calls == [
+        (
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            {
+                "check": True,
+                "capture_output": True,
+                "max_output_bytes": None,
+            },
+        )
+    ]
 
 
 def test_commit_and_push_discards_existing_new_commit_without_new_worktree_changes(

@@ -18,14 +18,6 @@ can then return success if those fallback checks are only `pass` or `skipping`.
 A fresh commit can therefore advance toward approval or merge when optional
 checks have reported success but required checks have not appeared yet.
 
-### M21. Bounded command capture can corrupt large untracked-file lists - `ralph_loop/process.py`, `ralph_loop/quality.py`
-
-GitHub JSON callers now request unbounded captured output, but
-`_untracked_files_for_commit()` still parses the default bounded
-`git ls-files --others --exclude-standard -z` output. A very large valid
-untracked-file list can be truncated before `_stage_commit_changes()` sees it,
-causing incomplete staging decisions.
-
 ## LOW / DEFERRED
 
 ### L5. `_round_numbers` remains a very thin helper - `ralph_loop/runtime.py`
