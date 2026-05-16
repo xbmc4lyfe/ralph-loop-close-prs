@@ -431,7 +431,7 @@ def test_pr_view_requests_fork_metadata_and_requires_object_shape(monkeypatch, s
         gh_ops._pr_view("3")
 
 
-def test_list_open_prs_returns_numbers_filtering_drafts_and_forks(monkeypatch, spy):
+def test_list_open_prs_returns_numbers_filtering_drafts_only(monkeypatch, spy):
     gh_json = spy(
         return_value=[
             {"number": 107, "isDraft": False, "isCrossRepository": False},
@@ -442,7 +442,7 @@ def test_list_open_prs_returns_numbers_filtering_drafts_and_forks(monkeypatch, s
     )
     monkeypatch.setattr(gh_ops, "_gh_json", gh_json)
 
-    assert gh_ops._list_open_prs("main") == [107, 105]
+    assert gh_ops._list_open_prs("main") == [107, 105, 94]
     call_args = gh_json.call_args.args[0]
     assert "--state" in call_args and "open" in call_args
     assert "--base" in call_args and "main" in call_args

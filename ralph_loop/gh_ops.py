@@ -321,8 +321,6 @@ def _list_open_prs(base: str) -> list:
             continue
         if item.get("isDraft"):
             continue
-        if item.get("isCrossRepository"):
-            continue
         numbers.append(number)
     return numbers
 

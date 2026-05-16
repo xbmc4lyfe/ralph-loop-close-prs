@@ -227,7 +227,6 @@ def test_main_signal_handler_exits_with_shell_status(
         ({"number": "7"}, "Could not resolve PR number"),
         ({"state": "CLOSED"}, "is not open"),
         ({"isDraft": True}, "draft state"),
-        ({"isCrossRepository": True}, "fork PR"),
         ({"baseRefName": "release"}, "targets base"),
         ({"headRefName": ""}, "Could not resolve PR head"),
         ({"headRefName": "main"}, "matches base"),
