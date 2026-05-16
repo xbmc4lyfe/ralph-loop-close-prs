@@ -10,7 +10,7 @@ import tempfile
 from typing import Dict, Optional, Set
 
 from .config import LOOP_ALREADY_RUNNING_MESSAGE
-from .errors import CommandError
+from .errors import LOOP_ALREADY_RUNNING_EXIT_CODE, CommandError
 from .process import _print_step, _run_command
 
 def _slug(value: str) -> str:
@@ -61,7 +61,7 @@ def _acquire_loop_lock(
             sys.stderr.write("{}\n".format(LOOP_ALREADY_RUNNING_MESSAGE))
             sys.stderr.flush()
             handle.close()
-            raise SystemExit(0)
+            raise SystemExit(LOOP_ALREADY_RUNNING_EXIT_CODE)
         handle.seek(0)
         handle.truncate(0)
         handle.write("{}\n".format(os.getpid()))
@@ -381,6 +381,27 @@ def _ensure_worktree_origin_matches(path: str):
 
 
 def _sync_existing_worktree(*, path: str, start_ref: str):
+    rebase_abort = _run_command(
+        ["git", "-C", path, "rebase", "--abort"],
+        check=False,
+        capture_output=True,
+        replay_output=False,
+    )
+    rebase_abort_text = "{}\n{}".format(
+        rebase_abort.stdout or "", rebase_abort.stderr or ""
+    ).lower()
+    if rebase_abort.returncode == 0:
+        _print_step("Aborted interrupted rebase in worktree {}".format(path))
+    elif (
+        "no rebase" not in rebase_abort_text
+        and "no rebase in progress" not in rebase_abort_text
+    ):
+        raise CommandError(
+            "Could not abort interrupted rebase in worktree {}: {}".format(
+                path,
+                (rebase_abort.stderr or rebase_abort.stdout or "").strip(),
+            )
+        )
     status = _run_command(
         ["git", "-C", path, "status", "--porcelain"],
         check=True,
@@ -471,7 +492,7 @@ def _ensure_pr_worktree(
                     path,
                 )
             )
-            raise SystemExit(0)
+            raise SystemExit(LOOP_ALREADY_RUNNING_EXIT_CODE)
     if os.path.isdir(path):
         _print_step("Using existing PR worktree {}".format(path))
         if not _worktree_path_is_registered(path):
@@ -533,7 +554,7 @@ def _ensure_pr_worktree(
     if "already used by worktree" in stderr:
         sys.stdout.write("{}\n".format(LOOP_ALREADY_RUNNING_MESSAGE))
         sys.stdout.flush()
-        raise SystemExit(0)
+        raise SystemExit(LOOP_ALREADY_RUNNING_EXIT_CODE)
     raise CommandError(
         "Unable to create worktree for branch '{}': {}".format(
             branch,

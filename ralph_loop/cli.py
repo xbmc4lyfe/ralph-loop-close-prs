@@ -15,7 +15,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from .checks import _wait_for_required_checks_green
 from .codex_agent import _run_ci_fix_round, _run_review_fix_round
 from .config import DEFAULT_WORKTREE_ROOT
-from .errors import CODEX_ENV_FAILURE_EXIT_CODE, CodexEnvironmentError, CommandError
+from .errors import (
+    CODEX_ENV_FAILURE_EXIT_CODE,
+    LOOP_ALREADY_RUNNING_EXIT_CODE,
+    CodexEnvironmentError,
+    CommandError,
+)
 from .gh_ops import (
     _list_open_prs,
     _mark_pr_needs_review,
@@ -511,27 +516,49 @@ def _fan_out_all_prs(
                 break
             now = time.monotonic()
             for pr in list(children.keys()):
-                proc, log_path, log_handle, _spawned_at = children[pr]
+                proc, log_path, log_handle, spawned_at = children[pr]
                 rc = proc.poll()
                 if rc is not None:
+                    try:
+                        log_handle.flush()
+                    except (OSError, ValueError):
+                        pass
+                    lifetime = now - spawned_at
+                    if rc == CODEX_ENV_FAILURE_EXIT_CODE:
+                        backoff_for_pr = env_failure_backoff
+                        reason = "codex env failure"
+                    elif rc == LOOP_ALREADY_RUNNING_EXIT_CODE:
+                        backoff_for_pr = env_failure_backoff
+                        reason = "another ralph loop already owns this PR"
+                    elif rc != 0 and lifetime < 60.0:
+                        prior = pending_backoff.get(pr, respawn_backoff)
+                        backoff_for_pr = min(env_failure_backoff, max(prior * 2, 30))
+                        reason = (
+                            "short-lived failure (lifetime={:.1f}s); escalating "
+                            "backoff to {}s".format(lifetime, backoff_for_pr)
+                        )
+                    else:
+                        backoff_for_pr = respawn_backoff
+                        reason = "ordinary exit"
+                    _print_step(
+                        "PR #{} loop exited with code {} ({}); respawning after "
+                        "{}s (log: {})".format(
+                            pr, rc, reason, backoff_for_pr, log_path
+                        )
+                    )
+                    try:
+                        with open(log_path, "ab", buffering=0) as marker:
+                            marker.write(
+                                "\n=== exit rc={} reason={} backoff={}s ===\n".format(
+                                    rc, reason, backoff_for_pr
+                                ).encode("utf-8", errors="replace")
+                            )
+                    except OSError:
+                        pass
                     try:
                         log_handle.close()
                     except OSError:
                         pass
-                    if rc == CODEX_ENV_FAILURE_EXIT_CODE:
-                        backoff_for_pr = env_failure_backoff
-                        _print_step(
-                            "PR #{} loop exited with codex env-failure code {} "
-                            "(log: {}); respawning after {}s (long backoff)".format(
-                                pr, rc, log_path, backoff_for_pr
-                            )
-                        )
-                    else:
-                        backoff_for_pr = respawn_backoff
-                        _print_step(
-                            "PR #{} loop exited with code {} (log: {}); respawning "
-                            "after {}s".format(pr, rc, log_path, backoff_for_pr)
-                        )
                     last_exit_at[pr] = now
                     pending_backoff[pr] = backoff_for_pr
                     del children[pr]

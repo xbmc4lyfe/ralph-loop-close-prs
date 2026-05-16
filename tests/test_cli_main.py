@@ -1101,9 +1101,10 @@ def test_fan_out_supervisor_uses_long_backoff_after_env_failure_exit(
 def test_fan_out_supervisor_respawns_normally_after_short_backoff_for_nonzero_exit(
     monkeypatch, cli_args, tmp_path
 ):
-    # Non-env-failure exit code uses the short respawn backoff and DOES respawn
-    # within the test window. This guards against the long-backoff change
-    # accidentally applying to ordinary failures.
+    # Non-env-failure exit code that ran for >60s (not short-lived) uses the
+    # short respawn backoff and DOES respawn within the test window. This
+    # guards against the long-backoff change accidentally applying to ordinary
+    # failures.
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [88])
     monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
     procs_made = []
@@ -1112,7 +1113,7 @@ def test_fan_out_supervisor_respawns_normally_after_short_backoff_for_nonzero_ex
         # First child exits with code 1 (ordinary failure); subsequent children
         # stay alive for the rest of the test.
         if not procs_made:
-            proc = _FakeProc(pid=600, exit_after_polls=1, returncode=1)
+            proc = _FakeProc(pid=600, exit_after_polls=20, returncode=1)
         else:
             proc = _FakeProc(pid=601, exit_after_polls=99, returncode=0)
         procs_made.append(proc)
@@ -1126,9 +1127,9 @@ def test_fan_out_supervisor_respawns_normally_after_short_backoff_for_nonzero_ex
     wait_calls = {"n": 0}
 
     def fake_wait(event, _timeout):
-        clock["t"] += 5.0
+        clock["t"] += 15.0
         wait_calls["n"] += 1
-        if wait_calls["n"] >= 4:
+        if wait_calls["n"] >= 30:
             event.set()
             return True
         return False

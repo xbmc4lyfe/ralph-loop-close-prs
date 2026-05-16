@@ -17,3 +17,8 @@ class CodexEnvironmentError(CommandError):
 
 CODEX_ENV_FAILURE_EXIT_CODE = 75
 
+# Exit code used when a ralph child detects that another ralph loop already
+# owns this PR's worktree/lock. The supervisor uses this to apply a long
+# backoff (no point re-spawning fast against an active sibling).
+LOOP_ALREADY_RUNNING_EXIT_CODE = 64
+

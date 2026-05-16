@@ -3,7 +3,7 @@ import os
 import pytest
 
 from ralph_loop import checks, runtime, worktrees
-from ralph_loop.errors import CommandError
+from ralph_loop.errors import LOOP_ALREADY_RUNNING_EXIT_CODE, CommandError
 
 
 @pytest.mark.parametrize(
@@ -48,7 +48,7 @@ def test_loop_lock_exits_cleanly_when_flock_is_blocked(monkeypatch, tmp_path, ca
     with pytest.raises(SystemExit) as raised:
         worktrees._acquire_loop_lock(pr_number=123)
 
-    assert raised.value.code == 0
+    assert raised.value.code == LOOP_ALREADY_RUNNING_EXIT_CODE
     assert "found another ralph loop" in capsys.readouterr().err
 
 
@@ -154,7 +154,7 @@ def test_ensure_pr_worktree_refuses_other_branch_worktree(
             branch="feature",
         )
 
-    assert raised.value.code == 0
+    assert raised.value.code == LOOP_ALREADY_RUNNING_EXIT_CODE
     assert fetch.call_count == 1
     assert "found another ralph loop" in capsys.readouterr().out
 
@@ -289,6 +289,7 @@ def test_sync_existing_worktree_fast_forwards_clean_stale_branch(
 ):
     run = spy(
         side_effect=[
+            completed_process(returncode=1, stderr="No rebase in progress?"),
             completed_process(stdout=""),
             completed_process(stdout="old\n"),
             completed_process(returncode=0),
@@ -300,11 +301,52 @@ def test_sync_existing_worktree_fast_forwards_clean_stale_branch(
     worktrees._sync_existing_worktree(path="/wt", start_ref="origin/feature")
 
     assert [call.args[0] for call in run.call_args_list] == [
+        ["git", "-C", "/wt", "rebase", "--abort"],
         ["git", "-C", "/wt", "status", "--porcelain"],
         ["git", "-C", "/wt", "rev-parse", "HEAD"],
         ["git", "-C", "/wt", "merge-base", "--is-ancestor", "old", "origin/feature"],
         ["git", "-C", "/wt", "reset", "--hard", "origin/feature"],
     ]
+
+
+def test_sync_existing_worktree_aborts_interrupted_rebase_before_status(
+    monkeypatch, spy, completed_process
+):
+    run = spy(
+        side_effect=[
+            completed_process(returncode=0),
+            completed_process(stdout=""),
+            completed_process(stdout="old\n"),
+            completed_process(returncode=0),
+            completed_process(),
+        ]
+    )
+    monkeypatch.setattr(worktrees, "_run_command", run)
+
+    worktrees._sync_existing_worktree(path="/wt", start_ref="origin/feature")
+
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["git", "-C", "/wt", "rebase", "--abort"],
+        ["git", "-C", "/wt", "status", "--porcelain"],
+        ["git", "-C", "/wt", "rev-parse", "HEAD"],
+        ["git", "-C", "/wt", "merge-base", "--is-ancestor", "old", "origin/feature"],
+        ["git", "-C", "/wt", "reset", "--hard", "origin/feature"],
+    ]
+
+
+def test_sync_existing_worktree_rejects_unknown_rebase_abort_failure(
+    monkeypatch, completed_process
+):
+    monkeypatch.setattr(
+        worktrees,
+        "_run_command",
+        lambda *_args, **_kwargs: completed_process(
+            returncode=1, stderr="could not read HEAD"
+        ),
+    )
+
+    with pytest.raises(CommandError, match="Could not abort interrupted rebase"):
+        worktrees._sync_existing_worktree(path="/wt", start_ref="origin/feature")
 
 
 def test_ensure_pr_worktree_creates_new_worktree(

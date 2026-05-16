@@ -25,6 +25,16 @@ _CODEX_ENV_FAILURE_PATTERNS = (
     re.compile(
         r"codex exec failed.*no partial last-message", re.IGNORECASE | re.DOTALL
     ),
+    # /review is a Codex slash-command, not a shell path. When the slash
+    # command isn't installed for the worktree, Codex shells it out via
+    # /bin/zsh -lc /review which exits 127. Treat that as an env failure
+    # (long backoff, no review counted) so we don't loop on it.
+    re.compile(
+        r"no such file or directory:\s*/review", re.IGNORECASE
+    ),
+    re.compile(
+        r"/bin/(?:ba|z)sh\s+-lc\s+/review.*exited\s+127", re.IGNORECASE | re.DOTALL
+    ),
 )
 
 
@@ -88,8 +98,15 @@ def _codex_exec_with_marker(
         ]
         if model:
             cmd.extend(["--model", model])
-        cmd.append(prompt)
-        completed = _run_command(cmd, check=False, capture_output=True)
+        cmd.append("-")
+        log_cmd = cmd[:-1] + ["<codex prompt on stdin>"]
+        completed = _run_command(
+            cmd,
+            check=False,
+            capture_output=True,
+            input_text=prompt,
+            log_cmd=log_cmd,
+        )
         try:
             with open(temp_path, "r", encoding="utf-8") as handle:
                 last_message = _truncate_for_log(
