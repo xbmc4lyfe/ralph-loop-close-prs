@@ -643,6 +643,91 @@ def test_fan_out_supervisor_respawns_exited_children_until_shutdown(
     assert (log_dir / "pr-50.log").exists()
 
 
+def test_fan_out_supervisor_escalates_backoff_across_consecutive_short_lived_failures(
+    monkeypatch, cli_args, tmp_path, capfd
+):
+    """Repeated short-lived child failures must ramp the respawn backoff
+    (30s -> 60s -> 120s -> 240s -> 300s cap) instead of plateauing at 30s.
+
+    Regression test: previously ``pending_backoff[pr]`` was popped on respawn,
+    so the next short-lived exit read ``prior = respawn_backoff`` (5s) and
+    computed ``min(env_failure_backoff, max(prior*2, 30)) = 30`` every cycle.
+    A PR with a permanent failure (e.g. unresolved merge conflict) cycled
+    every ~40s forever instead of slowing down.
+    """
+    import re
+
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [50])
+    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
+
+    procs_made = []
+
+    def fake_popen(_cmd, **_kwargs):
+        # Child always exits non-zero on its first poll.
+        proc = _FakeProc(
+            pid=100 + len(procs_made), exit_after_polls=1, returncode=1
+        )
+        procs_made.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["t"])
+
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        # Advance 30s per sweep: keeps child lifetime well under the 60s
+        # "short-lived" threshold and lets cooldowns expire over a handful of
+        # sweeps. Bail after enough iterations to observe several escalations.
+        clock["t"] += 30.0
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 60:
+            event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_respawn_backoff_seconds=5,
+            fan_out_env_failure_backoff_seconds=300,
+            fan_out_stuck_timeout_seconds=900,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+    assert rc == 0
+
+    err = capfd.readouterr().err
+    backoffs = [int(m) for m in re.findall(r"escalating backoff to (\d+)s", err)]
+    assert backoffs, "expected escalating-backoff messages in supervisor output"
+    # First short-lived failure starts at 30s; each subsequent consecutive
+    # short-lived failure should roughly double up to the env-failure cap.
+    assert backoffs[0] == 30
+    assert backoffs[1] >= 60, (
+        "second consecutive short-lived failure should escalate beyond 30s; "
+        "observed sequence: {}".format(backoffs)
+    )
+    # Sequence must be non-decreasing up to the cap.
+    for prev, cur in zip(backoffs, backoffs[1:]):
+        assert cur >= prev, "backoff regressed mid-sequence: {}".format(backoffs)
+    # And it should eventually hit the env-failure cap given enough cycles.
+    assert max(backoffs) >= 240, (
+        "expected backoff to ramp toward the env-failure cap; saw {}".format(
+            backoffs
+        )
+    )
+
+
 def test_fan_out_supervisor_kills_idle_child_using_log_mtime_watchdog(
     monkeypatch, cli_args, tmp_path
 ):
@@ -1029,6 +1114,63 @@ def test_fan_out_respawn_block_keeps_pr_when_state_check_raises(
     assert len(procs_made) >= 2
     stderr = capsys.readouterr().err
     assert "Could not confirm PR #50 open state for respawn" in stderr
+
+
+def test_fan_out_respawn_checks_open_state_only_after_backoff_expires(
+    monkeypatch, cli_args, tmp_path
+):
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [50])
+    procs_made = []
+    clock = {"t": 0.0}
+    open_state_times = []
+
+    def fake_state(_pr):
+        open_state_times.append(clock["t"])
+        return True
+
+    def fake_popen(_cmd, **_kwargs):
+        if not procs_made:
+            proc = _FakeProc(pid=450, exit_after_polls=1, returncode=0)
+        else:
+            proc = _FakeProc(pid=451, exit_after_polls=99, returncode=0)
+        procs_made.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli, "_pr_is_still_open", fake_state)
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli.os.path, "getmtime", lambda _path: 9e18)
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["t"])
+
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        clock["t"] += 10.0
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 8:
+            event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_respawn_backoff_seconds=60,
+            fan_out_stuck_timeout_seconds=60,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    assert len(procs_made) == 2
+    assert open_state_times == [0.0, 70.0]
 
 
 def test_compatibility_script_prints_command_error(monkeypatch, capsys):

@@ -605,37 +605,31 @@ def _fan_out_all_prs(
                     del children[pr]
             if shutting_down["flag"]:
                 break
-            if last_exit_at:
-                # Use a per-PR `gh pr view` for each candidate respawn rather
-                # than `gh pr list`. The list endpoint has eventual-consistency
-                # lag where a just-merged PR is briefly absent or briefly still
-                # present; a targeted view returns the authoritative state. We
-                # only drop PRs on definitive non-OPEN results — transient
-                # failures bubble up as "keep in respawn set" so a flaky
-                # network does not silently lose work.
-                for pr in list(last_exit_at.keys()):
-                    try:
-                        still_open = _pr_is_still_open(pr)
-                    except CommandError as exc:
-                        _print_step(
-                            "Could not confirm PR #{} open state for respawn "
-                            "({}); keeping it in the respawn set.".format(
-                                pr, exc
-                            )
-                        )
-                        continue
-                    if not still_open:
-                        _print_step(
-                            "PR #{} is no longer open; dropping from respawn "
-                            "set.".format(pr)
-                        )
-                        last_exit_at.pop(pr, None)
-                        pending_backoff.pop(pr, None)
             for pr in list(last_exit_at.keys()):
                 if pr in children:
                     continue
                 backoff_for_pr = pending_backoff.get(pr, respawn_backoff)
-                if time.monotonic() - last_exit_at[pr] < backoff_for_pr:
+                if now - last_exit_at[pr] < backoff_for_pr:
+                    continue
+                # Use a per-PR `gh pr view` only once the child is actually
+                # eligible for respawn. Checking on every supervisor sweep
+                # produces noisy repeated `gh pr view` bursts while the PR is
+                # still cooling down under backoff.
+                try:
+                    still_open = _pr_is_still_open(pr)
+                except CommandError as exc:
+                    _print_step(
+                        "Could not confirm PR #{} open state for respawn "
+                        "({}); keeping it in the respawn set.".format(pr, exc)
+                    )
+                    still_open = True
+                if not still_open:
+                    _print_step(
+                        "PR #{} is no longer open; dropping from respawn "
+                        "set.".format(pr)
+                    )
+                    last_exit_at.pop(pr, None)
+                    pending_backoff.pop(pr, None)
                     continue
                 proc, log_path, log_handle = _spawn_child(
                     pr=pr,
@@ -645,7 +639,12 @@ def _fan_out_all_prs(
                 )
                 children[pr] = (proc, log_path, log_handle, time.monotonic())
                 last_exit_at.pop(pr, None)
-                pending_backoff.pop(pr, None)
+                # Intentionally keep pending_backoff[pr] across the respawn:
+                # the short-lived-failure ramp (30s -> 60s -> 120s -> ...) reads
+                # the previous value as ``prior`` and only escalates if it
+                # survives the respawn. The natural resets are the
+                # ordinary-exit and stuck-timeout branches above, which both
+                # rewrite pending_backoff to ``respawn_backoff``.
                 _print_step(
                     "Respawned PR #{} pid={} (log: {})".format(
                         pr, proc.pid, log_path
