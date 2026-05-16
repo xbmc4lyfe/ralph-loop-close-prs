@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import random
+import time
 
 from .config import (
     GH_USER,
@@ -15,6 +17,39 @@ from .errors import CommandError
 from .gh_ops import _active_gh_user
 from .git_ops import _git_config_get
 from .process import _print_step, _run_command
+
+
+_GIT_CONFIG_LOCK_RETRIES = 12
+_GIT_CONFIG_LOCK_BASE_DELAY = 0.05
+
+
+def _set_git_config_if_changed(key: str, value: str) -> None:
+    """Write `git config <key> <value>` only if the current value differs.
+
+    Retries on `.git/config.lock` contention so concurrent fan-out children
+    sharing the same repo config don't race each other to failure.
+    """
+    if _git_config_get(key) == value:
+        return
+    last_error: CommandError = CommandError("")
+    for attempt in range(_GIT_CONFIG_LOCK_RETRIES):
+        try:
+            _run_command(
+                ["git", "config", key, value],
+                check=True,
+                capture_output=True,
+            )
+            return
+        except CommandError as exc:
+            text = str(exc)
+            if "could not lock config file" not in text:
+                raise
+            last_error = exc
+            delay = _GIT_CONFIG_LOCK_BASE_DELAY * (2 ** attempt)
+            time.sleep(delay + random.uniform(0, delay))
+            if _git_config_get(key) == value:
+                return
+    raise last_error
 
 def _is_truthy(value: str) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
@@ -103,33 +138,9 @@ def _ensure_runtime_identity():
     _print_step(
         "Setting git identity and SSH/signing keys for '{}'".format(GH_USER)
     )
-    _run_command(
-        ["git", "config", "user.name", GIT_NAME],
-        check=True,
-        capture_output=True,
-    )
-    _run_command(
-        ["git", "config", "user.email", GIT_EMAIL],
-        check=True,
-        capture_output=True,
-    )
-    _run_command(
-        ["git", "config", "core.sshCommand", SSH_COMMAND],
-        check=True,
-        capture_output=True,
-    )
-    _run_command(
-        ["git", "config", "gpg.format", "ssh"],
-        check=True,
-        capture_output=True,
-    )
-    _run_command(
-        ["git", "config", "user.signingkey", SSH_SIGNING_KEY],
-        check=True,
-        capture_output=True,
-    )
-    _run_command(
-        ["git", "config", "commit.gpgsign", "true"],
-        check=True,
-        capture_output=True,
-    )
+    _set_git_config_if_changed("user.name", GIT_NAME)
+    _set_git_config_if_changed("user.email", GIT_EMAIL)
+    _set_git_config_if_changed("core.sshCommand", SSH_COMMAND)
+    _set_git_config_if_changed("gpg.format", "ssh")
+    _set_git_config_if_changed("user.signingkey", SSH_SIGNING_KEY)
+    _set_git_config_if_changed("commit.gpgsign", "true")

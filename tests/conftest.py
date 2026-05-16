@@ -44,6 +44,8 @@ def make_args(**overrides):
         "directory": None,
         "all_prs": False,
         "fan_out_log_dir": None,
+        "fan_out_stuck_timeout_seconds": 900,
+        "fan_out_respawn_backoff_seconds": 5,
     }
     values.update(overrides)
     return argparse.Namespace(**values)

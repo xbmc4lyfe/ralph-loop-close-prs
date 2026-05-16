@@ -161,8 +161,24 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Directory to write per-PR fan-out logs into. Defaults to "
-            "'.ralph-logs/fan-out' under the current working directory."
+            "<ralph-script-dir>/.ralph-logs/fan-out so logs stay outside "
+            "the target repository."
         ),
+    )
+    parser.add_argument(
+        "--fan-out-stuck-timeout-seconds",
+        type=_pos_int,
+        default=900,
+        help=(
+            "Kill and respawn any fan-out child whose log file has not been "
+            "written to in this many seconds. Minimum 60."
+        ),
+    )
+    parser.add_argument(
+        "--fan-out-respawn-backoff-seconds",
+        type=_pos_int,
+        default=5,
+        help="Seconds to wait before respawning an exited fan-out child.",
     )
     parser.add_argument(
         "directory",
@@ -270,6 +286,30 @@ def _passthrough_args(argv: List[str]) -> List[str]:
     return out
 
 
+def _spawn_child(
+    *,
+    pr: int,
+    script_path: str,
+    base_child_args: List[str],
+    log_root: str,
+) -> Tuple[subprocess.Popen, str, Any]:
+    cmd = [sys.executable, script_path] + base_child_args + ["--pr", str(pr)]
+    log_path = os.path.join(log_root, "pr-{}.log".format(pr))
+    log_handle = open(log_path, "ab", buffering=0)
+    log_handle.write(
+        "\n=== spawn {} ===\n$ {}\n".format(
+            time.strftime("%Y-%m-%d %H:%M:%S"), shlex.join(cmd)
+        ).encode("utf-8", errors="replace")
+    )
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    return proc, log_path, log_handle
+
+
 def _fan_out_all_prs(
     args: argparse.Namespace, argv: List[str], script_path: str
 ) -> int:
@@ -279,64 +319,147 @@ def _fan_out_all_prs(
             "No open non-draft PRs found targeting base '{}'.".format(args.base)
         )
         return 0
-    log_root = os.path.abspath(
-        os.path.expanduser(args.fan_out_log_dir or ".ralph-logs/fan-out")
-    )
+    if args.fan_out_log_dir:
+        log_root = os.path.abspath(os.path.expanduser(args.fan_out_log_dir))
+    else:
+        log_root = os.path.join(
+            os.path.dirname(script_path), ".ralph-logs", "fan-out"
+        )
     os.makedirs(log_root, exist_ok=True)
+    stuck_timeout = max(60, args.fan_out_stuck_timeout_seconds)
+    respawn_backoff = max(1, args.fan_out_respawn_backoff_seconds)
     _print_step(
-        "Fan-out: launching ralph loops for {} open PR(s): {} (logs in {})".format(
+        "Fan-out supervisor: {} open PR(s): {} (logs in {}; stuck timeout {}s; "
+        "respawn backoff {}s)".format(
             len(pr_numbers),
             ", ".join("#" + str(n) for n in pr_numbers),
             log_root,
+            stuck_timeout,
+            respawn_backoff,
         )
     )
     base_child_args = _passthrough_args(argv)
-    procs: List[Tuple[int, subprocess.Popen, str, Any]] = []
-    for pr in pr_numbers:
-        cmd = [sys.executable, script_path] + base_child_args + ["--pr", str(pr)]
-        log_path = os.path.join(log_root, "pr-{}.log".format(pr))
-        log_handle = open(log_path, "ab", buffering=0)
-        _print_step("Launching PR #{} (log: {})".format(pr, log_path))
-        log_handle.write(
-            "$ {}\n".format(shlex.join(cmd)).encode("utf-8", errors="replace")
+    children: Dict[int, Tuple[subprocess.Popen, str, Any, float]] = {}
+    last_exit_at: Dict[int, float] = {}
+    shutting_down = {"flag": False}
+
+    def _request_shutdown(signum, _frame):
+        shutting_down["flag"] = True
+        sys.stderr.write(
+            "\nSupervisor received {}; terminating children...\n".format(
+                signal.Signals(signum).name
+            )
         )
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-        )
-        procs.append((pr, proc, log_path, log_handle))
-    failures: List[Tuple[int, int]] = []
-    for pr, proc, log_path, log_handle in procs:
-        rc = proc.wait()
-        try:
-            log_handle.close()
-        except OSError:
-            pass
-        if rc != 0:
-            failures.append((pr, rc))
+        sys.stderr.flush()
+
+    previous_int = signal.signal(signal.SIGINT, _request_shutdown)
+    previous_term = signal.signal(signal.SIGTERM, _request_shutdown)
+    try:
+        for pr in pr_numbers:
+            proc, log_path, log_handle = _spawn_child(
+                pr=pr,
+                script_path=script_path,
+                base_child_args=base_child_args,
+                log_root=log_root,
+            )
+            children[pr] = (proc, log_path, log_handle, time.monotonic())
             _print_step(
-                "PR #{} loop exited with code {} (log: {})".format(
-                    pr, rc, log_path
+                "Launched PR #{} pid={} (log: {})".format(pr, proc.pid, log_path)
+            )
+        while not shutting_down["flag"] and (children or last_exit_at):
+            time.sleep(min(10, stuck_timeout))
+            now = time.monotonic()
+            for pr in list(children.keys()):
+                proc, log_path, log_handle, _spawned_at = children[pr]
+                rc = proc.poll()
+                if rc is not None:
+                    try:
+                        log_handle.close()
+                    except OSError:
+                        pass
+                    _print_step(
+                        "PR #{} loop exited with code {} (log: {}); respawning "
+                        "after {}s".format(pr, rc, log_path, respawn_backoff)
+                    )
+                    last_exit_at[pr] = now
+                    del children[pr]
+                    continue
+                try:
+                    mtime = os.path.getmtime(log_path)
+                except OSError:
+                    mtime = time.time()
+                if time.time() - mtime > stuck_timeout:
+                    _print_step(
+                        "PR #{} log idle >{}s; killing pid={} for respawn".format(
+                            pr, stuck_timeout, proc.pid
+                        )
+                    )
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    try:
+                        log_handle.close()
+                    except OSError:
+                        pass
+                    last_exit_at[pr] = now
+                    del children[pr]
+            if shutting_down["flag"]:
+                break
+            for pr in list(last_exit_at.keys()):
+                if pr in children:
+                    continue
+                if time.monotonic() - last_exit_at[pr] < respawn_backoff:
+                    continue
+                proc, log_path, log_handle = _spawn_child(
+                    pr=pr,
+                    script_path=script_path,
+                    base_child_args=base_child_args,
+                    log_root=log_root,
                 )
-            )
-        else:
-            _print_step(
-                "PR #{} loop completed successfully (log: {})".format(pr, log_path)
-            )
-    if failures:
-        _print_step(
-            "{} of {} PR loops failed: {}".format(
-                len(failures),
-                len(pr_numbers),
-                ", ".join("#{}={}".format(pr, rc) for pr, rc in failures),
-            )
-        )
-        return 1
-    _print_step(
-        "All {} PR loops completed successfully".format(len(pr_numbers))
-    )
+                children[pr] = (proc, log_path, log_handle, time.monotonic())
+                last_exit_at.pop(pr, None)
+                _print_step(
+                    "Respawned PR #{} pid={} (log: {})".format(
+                        pr, proc.pid, log_path
+                    )
+                )
+    finally:
+        for pr, (proc, _log_path, log_handle, _spawned_at) in list(children.items()):
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        for pr, (proc, _log_path, log_handle, _spawned_at) in list(children.items()):
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            try:
+                log_handle.close()
+            except OSError:
+                pass
+        signal.signal(signal.SIGINT, previous_int)
+        signal.signal(signal.SIGTERM, previous_term)
+    _print_step("Fan-out supervisor exited cleanly.")
     return 0
 
 

@@ -439,74 +439,63 @@ def test_should_fan_out_implicitly_true_only_when_on_base_without_pr_or_flag(
 
 
 class _FakeProc:
-    def __init__(self, returncode=0):
-        self.returncode = returncode
-        self.wait_called = False
+    """Fake subprocess.Popen-ish object for supervisor tests."""
 
-    def wait(self):
-        self.wait_called = True
-        return self.returncode
+    def __init__(self, pid=0, exit_after_polls=0, returncode=0):
+        self.pid = pid
+        self._exit_after = exit_after_polls
+        self._polls = 0
+        self.returncode = None
+        self._final_code = returncode
+        self.terminated = False
+        self.killed = False
 
+    def poll(self):
+        self._polls += 1
+        if self._polls >= self._exit_after:
+            self.returncode = self._final_code
+            return self._final_code
+        return None
 
-def test_fan_out_all_prs_spawns_one_subprocess_per_pr_and_returns_zero(
-    monkeypatch, cli_args, tmp_path, capsys
-):
-    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [107, 105, 99])
-    spawned = []
-    captured_kwargs = []
+    def wait(self, timeout=None):
+        self.returncode = self._final_code
+        return self._final_code
 
-    def fake_popen(cmd, *a, **kw):
-        spawned.append(cmd)
-        captured_kwargs.append(kw)
-        return _FakeProc(0)
+    def terminate(self):
+        self.terminated = True
+        self.returncode = self._final_code
 
-    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
-    script_path = str(tmp_path / "script.py")
-    (tmp_path / "script.py").write_text("# stub\n")
-    log_dir = tmp_path / "fan-out-logs"
-
-    rc = cli._fan_out_all_prs(
-        cli_args(all_prs=True, fan_out_log_dir=str(log_dir)),
-        ["./script.py", "--all-prs", "--base", "main"],
-        script_path,
-    )
-
-    assert rc == 0
-    assert len(spawned) == 3
-    for cmd, expected_pr in zip(spawned, [107, 105, 99]):
-        assert cmd[0] == sys.executable
-        assert cmd[1] == script_path
-        assert "--all-prs" not in cmd
-        assert cmd[-2:] == ["--pr", str(expected_pr)]
-    for kw in captured_kwargs:
-        assert kw["stdin"] is subprocess.DEVNULL
-        assert kw["stderr"] is subprocess.STDOUT
-        assert hasattr(kw["stdout"], "write")
-    assert log_dir.is_dir()
-    for pr in [107, 105, 99]:
-        assert (log_dir / "pr-{}.log".format(pr)).exists()
+    def kill(self):
+        self.killed = True
+        self.returncode = self._final_code
 
 
-def test_fan_out_all_prs_returns_one_when_any_child_fails(
-    monkeypatch, cli_args, tmp_path
-):
-    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [10, 11])
-    codes = iter([0, 2])
+def test_spawn_child_uses_devnull_stdin_and_writes_log_header(monkeypatch, tmp_path):
+    captured = {}
 
-    def fake_popen(_cmd, *a, **kw):
-        return _FakeProc(next(codes))
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return _FakeProc(pid=42, exit_after_polls=1)
 
     monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
-    script_path = str(tmp_path / "script.py")
-    (tmp_path / "script.py").write_text("# stub\n")
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
 
-    rc = cli._fan_out_all_prs(
-        cli_args(all_prs=True),
-        ["script.py", "--all-prs"],
-        script_path,
+    proc, log_path, log_handle = cli._spawn_child(
+        pr=77,
+        script_path="/abs/script.py",
+        base_child_args=["--base", "main"],
+        log_root=str(log_root),
     )
 
-    assert rc == 1
+    assert proc.pid == 42
+    assert log_path == str(log_root / "pr-77.log")
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"]["stderr"] is subprocess.STDOUT
+    assert captured["cmd"][-2:] == ["--pr", "77"]
+    log_handle.close()
+    assert "spawn" in (log_root / "pr-77.log").read_text()
 
 
 def test_fan_out_all_prs_returns_zero_when_no_open_prs(
@@ -524,6 +513,95 @@ def test_fan_out_all_prs_returns_zero_when_no_open_prs(
     )
 
     assert rc == 0
+
+
+def test_fan_out_supervisor_respawns_exited_children_until_shutdown(
+    monkeypatch, cli_args, tmp_path
+):
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [50])
+    procs_made = []
+
+    def fake_popen(_cmd, **_kwargs):
+        proc = _FakeProc(pid=100 + len(procs_made), exit_after_polls=1)
+        procs_made.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["t"])
+
+    sleep_calls = {"n": 0}
+
+    def fake_sleep(_seconds):
+        clock["t"] += 60.0
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 3:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_respawn_backoff_seconds=1,
+            fan_out_stuck_timeout_seconds=60,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    assert len(procs_made) >= 2, "supervisor should respawn at least once"
+    assert (log_dir / "pr-50.log").exists()
+
+
+def test_fan_out_supervisor_kills_idle_child_using_log_mtime_watchdog(
+    monkeypatch, cli_args, tmp_path
+):
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [33])
+    procs_made = []
+
+    def fake_popen(_cmd, **_kwargs):
+        proc = _FakeProc(pid=200 + len(procs_made), exit_after_polls=99)
+        procs_made.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli.os.path, "getmtime", lambda _path: 0.0)
+    sleep_calls = {"n": 0}
+
+    def fake_sleep(_seconds):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_stuck_timeout_seconds=60,
+            fan_out_respawn_backoff_seconds=1,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    assert any(p.terminated or p.killed for p in procs_made), (
+        "watchdog should have terminated the idle child"
+    )
 
 
 def test_main_with_all_prs_triggers_fan_out_and_skips_single_pr_path(

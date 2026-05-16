@@ -616,28 +616,58 @@ def test_ensure_runtime_identity_writes_all_git_config_values(
     monkeypatch.setattr(identity.os.path, "exists", lambda _path: True)
     monkeypatch.setattr(identity, "_active_gh_user", lambda: identity.GH_USER)
     monkeypatch.setattr(identity, "_run_command", run)
+    monkeypatch.setattr(identity, "_git_config_get", lambda _key: "")
 
     identity._ensure_runtime_identity()
 
-    assert run.call_count == 7
-    assert run.call_args_list[0].args[0] == [
-        "git",
-        "remote",
-        "get-url",
-        "origin",
+    config_writes = [
+        call.args[0]
+        for call in run.call_args_list
+        if call.args[0][:2] == ["git", "config"]
     ]
-    assert run.call_args_list[1].args[0] == [
-        "git",
-        "config",
-        "user.name",
-        identity.GIT_NAME,
-    ]
-    assert run.call_args_list[-1].args[0] == [
-        "git",
-        "config",
-        "commit.gpgsign",
-        "true",
-    ]
+    assert len(config_writes) == 6
+    assert ["git", "config", "user.name", identity.GIT_NAME] in config_writes
+    assert ["git", "config", "commit.gpgsign", "true"] in config_writes
+
+
+def test_set_git_config_if_changed_skips_when_value_matches(monkeypatch):
+    monkeypatch.setattr(identity, "_git_config_get", lambda _key: "stable")
+    monkeypatch.setattr(
+        identity,
+        "_run_command",
+        lambda *_a, **_k: pytest.fail("should not write when value matches"),
+    )
+    identity._set_git_config_if_changed("user.name", "stable")
+
+
+def test_set_git_config_if_changed_retries_on_lock_conflict(monkeypatch, spy):
+    monkeypatch.setattr(identity, "_git_config_get", lambda _key: "old")
+    monkeypatch.setattr(identity.time, "sleep", lambda _s: None)
+    calls = []
+
+    def flaky_run(cmd, *_a, **_k):
+        calls.append(cmd)
+        if len(calls) < 3:
+            raise CommandError(
+                "Command failed (exit=255): git config user.name new\n"
+                "error: could not lock config file .git/config: File exists"
+            )
+        return None
+
+    monkeypatch.setattr(identity, "_run_command", flaky_run)
+    identity._set_git_config_if_changed("user.name", "new")
+    assert len(calls) == 3
+
+
+def test_set_git_config_if_changed_reraises_non_lock_errors(monkeypatch):
+    monkeypatch.setattr(identity, "_git_config_get", lambda _key: "old")
+
+    def boom(*_a, **_k):
+        raise CommandError("Command failed (exit=128): permission denied")
+
+    monkeypatch.setattr(identity, "_run_command", boom)
+    with pytest.raises(CommandError, match="permission denied"):
+        identity._set_git_config_if_changed("user.name", "new")
 
 
 def test_ensure_runtime_identity_rejects_non_ssh_origin_remote(
