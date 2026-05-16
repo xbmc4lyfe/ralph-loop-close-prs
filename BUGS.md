@@ -26,13 +26,6 @@ GitHub JSON callers now request unbounded captured output, but
 untracked-file list can be truncated before `_stage_commit_changes()` sees it,
 causing incomplete staging decisions.
 
-### M24. Local quality failure output is still replayed locally before redaction - `ralph_loop/quality.py`, `ralph_loop/process.py`
-
-Local quality failure summaries are redacted before they are injected into Codex
-repair prompts, but `_run_command()` can still replay captured stdout/stderr to
-the local Ralph logs and terminal. Token-bearing tool output can therefore be
-exposed locally even though prompt injection is now reduced.
-
 ## LOW / DEFERRED
 
 ### L5. `_round_numbers` remains a very thin helper - `ralph_loop/runtime.py`
