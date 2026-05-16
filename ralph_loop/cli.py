@@ -131,9 +131,32 @@ def _parse_args() -> argparse.Namespace:
         help="Timeout for a single required-check wait cycle (positive integer seconds).",
     )
     parser.add_argument(
+        "--provider",
+        choices=["openai", "anthropic"],
+        default="openai",
+        help=(
+            "Which AI provider to drive the review/fix loop. 'openai' invokes "
+            "the codex CLI (default). 'anthropic' invokes the claude CLI in "
+            "print mode with an inlined review prompt."
+        ),
+    )
+    parser.add_argument(
         "--model",
         default=None,
-        help="Optional Codex model override passed as --model.",
+        help=(
+            "Override the per-provider default model. Defaults: gpt-5.5 for "
+            "openai, claude-opus-4-7 for anthropic."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "low", "medium", "high", "xhigh"],
+        default=None,
+        help=(
+            "Reasoning effort to pass to the OpenAI model "
+            "(via codex -c model_reasoning_effort=...). Defaults to 'xhigh' "
+            "for openai. Ignored for anthropic."
+        ),
     )
     parser.add_argument(
         "--skip-rebase",
@@ -1001,6 +1024,8 @@ def main() -> int:
                 args.base,
                 args.model,
                 external_comments=external_comments,
+                provider=args.provider,
+                reasoning_effort=args.reasoning_effort,
             )
             if not review_passed:
                 commit_state = _commit_and_push(
@@ -1013,6 +1038,8 @@ def main() -> int:
                     max_local_quality_rounds=args.max_local_quality_rounds,
                     pre_round_sha=pre_round_sha,
                     deadline=deadline,
+                    provider=args.provider,
+                    reasoning_effort=args.reasoning_effort,
                 )
                 if commit_state == "discarded":
                     _print_step(
@@ -1041,6 +1068,8 @@ def main() -> int:
                 max_local_quality_rounds=args.max_local_quality_rounds,
                 pre_round_sha=pre_round_sha,
                 deadline=deadline,
+                provider=args.provider,
+                reasoning_effort=args.reasoning_effort,
             )
             if commit_state == "discarded":
                 review_passed = False
@@ -1090,6 +1119,8 @@ def main() -> int:
                 round_number=round_number,
                 checks=checks,
                 model=args.model,
+                provider=args.provider,
+                reasoning_effort=args.reasoning_effort,
             )
             if not ready:
                 _reset_generated_changes(pre_round_sha)
@@ -1109,6 +1140,8 @@ def main() -> int:
                 max_local_quality_rounds=args.max_local_quality_rounds,
                 pre_round_sha=pre_round_sha,
                 deadline=deadline,
+                provider=args.provider,
+                reasoning_effort=args.reasoning_effort,
             )
             if commit_state == "discarded":
                 _print_step(

@@ -67,6 +67,9 @@ The script has several baked-in assumptions. It is not generic.
 - `git config user.email` must be `xbmc4lyfe@users.noreply.github.com`
 - `git config commit.gpgsign` must be enabled
 - `git user.signingkey` must already be configured
+- `RALPH_COAUTHOR_LINE`, if overridden, must be a single `Co-Authored-By`
+  trailer whose email is the active git email, the built-in `oz-agent@warp.dev`
+  co-author, or listed in `RALPH_COAUTHOR_ALLOWED_EMAILS`
 - the PR must not be a fork PR; Ralph pushes fixes to `origin <branch>`
 - The following files must exist:
   - `/Users/allen/.ssh/id_ed25519_xbmc4lyfe`
@@ -82,6 +85,8 @@ Environment path overrides such as `RALPH_SSH_AUTH_KEY`,
 `RALPH_SSH_SIGNING_KEY`, and `RALPH_WORKTREE_ROOT` expand a leading `~`.
 Path tokens inside `RALPH_SSH_COMMAND` are also expanded when the command can be
 parsed with normal shell quoting.
+`RALPH_COAUTHOR_ALLOWED_EMAILS` is a comma-separated allowlist for additional
+co-author trailer emails.
 
 ## Worktree Behavior
 
@@ -140,7 +145,8 @@ If merge is enabled, the script will:
 
 - add the `needs review` label to the PR
 - approve the PR as the authenticated GitHub user if needed
-- merge with `gh pr merge --rebase --delete-branch --match-head-commit <sha>`
+- merge with `gh pr merge --rebase --match-head-commit <sha>`
+- delete the PR head branch through the GitHub API after a successful merge
 
 ## CLI
 
@@ -159,7 +165,9 @@ Important flags:
 - `--max-local-quality-rounds <n>`: limit local `just ci` or `just test` repair rounds
 - `--poll-seconds <n>`: CI polling interval, default `20`
 - `--checks-timeout-seconds <n>`: timeout for one CI wait cycle, default `5400`
-- `--model <name>`: pass a model override to `codex exec`
+- `--provider <openai|anthropic>`: which AI provider drives the review/fix loop. `openai` (default) invokes the `codex` CLI; `anthropic` invokes the `claude` CLI in print mode with an inlined review prompt
+- `--model <name>`: override the per-provider default model. Defaults: `gpt-5.5` for openai, `claude-opus-4-7` for anthropic
+- `--reasoning-effort <none|low|medium|high|xhigh>`: reasoning effort for the OpenAI model (passed as `codex -c model_reasoning_effort=...`). Defaults to `xhigh` for openai; ignored for anthropic
 - `--skip-rebase`: skip both the initial and final rebase steps
 - `--skip-merge`: stop after CI is green without merging
 - `--dry-run`: resolve and validate the PR, then stop before local or remote mutations
@@ -174,6 +182,18 @@ Example:
 
 ```bash
 python3 codex_ralph_wiggum_loop.py --pr 123 --base main --skip-merge
+```
+
+Run against multiple repo directories in parallel (one supervisor per folder):
+
+```bash
+python3 codex_ralph_wiggum_loop.py folder1 folder2 folder3
+```
+
+Use Anthropic with Opus 4.7 instead of OpenAI/Codex:
+
+```bash
+python3 codex_ralph_wiggum_loop.py --provider anthropic --pr 123
 ```
 
 ## Notes

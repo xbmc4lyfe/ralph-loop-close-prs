@@ -14,6 +14,32 @@ from .process import _print_step, _run_command, _truncate_for_log
 
 CODEX_LAST_MESSAGE_LIMIT = 4000
 
+# Per-provider best-model defaults. Override with --model.
+_DEFAULT_MODEL_PER_PROVIDER = {
+    "openai": "gpt-5.5",
+    "anthropic": "claude-opus-4-7",
+}
+
+# Default reasoning effort for the openai provider when --reasoning-effort
+# is not passed. xhigh is the strongest documented level for gpt-5.5 and
+# is intended for hard asynchronous agentic tasks (which Ralph is).
+_DEFAULT_OPENAI_REASONING_EFFORT = "xhigh"
+
+
+def _resolve_model(provider: str, model: Optional[str]) -> Optional[str]:
+    if model:
+        return model
+    return _DEFAULT_MODEL_PER_PROVIDER.get(provider)
+
+
+def _resolve_reasoning_effort(
+    provider: str, reasoning_effort: Optional[str]
+) -> Optional[str]:
+    if provider != "openai":
+        return None
+    return reasoning_effort or _DEFAULT_OPENAI_REASONING_EFFORT
+
+
 # Patterns that indicate codex itself (the upstream CLI / transport) is in an
 # unrecoverable environmental state rather than reporting a reviewable result.
 # Matching any of these means a respawn-immediately retry will just burn tokens
@@ -52,6 +78,33 @@ def _detect_codex_env_failure(*texts: str) -> Optional[str]:
         if not text:
             continue
         for pattern in _CODEX_ENV_FAILURE_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                return match.group(0)
+    return None
+
+
+# Same idea as the codex patterns above, but tuned to the messages the
+# Claude Code CLI emits when it cannot reach the Anthropic API or the
+# account is in a hard-fail state.
+_CLAUDE_ENV_FAILURE_PATTERNS = (
+    re.compile(r"\b401\s+Unauthorized\b", re.IGNORECASE),
+    re.compile(r"invalid[_\s-]?api[_\s-]?key", re.IGNORECASE),
+    re.compile(r"authentication[_\s-]?error", re.IGNORECASE),
+    re.compile(r"\bcredit\s+balance\b|\bover.*quota\b", re.IGNORECASE),
+    re.compile(r"\busage\s+limit\b", re.IGNORECASE),
+    re.compile(r"\brate[_\s-]?limit", re.IGNORECASE),
+    re.compile(r"HTTP\s+error:\s*5\d\d", re.IGNORECASE),
+    re.compile(r"\bclaude(?:\s+code)?(?:\s+CLI)?\s+is\s+not\s+(?:installed|found)\b", re.IGNORECASE),
+    re.compile(r"command\s+not\s+found:\s*claude", re.IGNORECASE),
+)
+
+
+def _detect_claude_env_failure(*texts: str) -> Optional[str]:
+    for text in texts:
+        if not text:
+            continue
+        for pattern in _CLAUDE_ENV_FAILURE_PATTERNS:
             match = pattern.search(text)
             if match:
                 return match.group(0)
@@ -113,7 +166,17 @@ def _codex_exec_with_marker(
     marker_regex: str,
     model: Optional[str],
     sandbox: str = "danger-full-access",
+    provider: str = "openai",
+    reasoning_effort: Optional[str] = None,
 ) -> Tuple[Optional[bool], str]:
+    if provider == "anthropic":
+        return _claude_exec_with_marker(
+            prompt=prompt,
+            marker_regex=marker_regex,
+            model=_resolve_model(provider, model),
+        )
+    effective_model = _resolve_model(provider, model)
+    effective_effort = _resolve_reasoning_effort(provider, reasoning_effort)
     with tempfile.TemporaryDirectory(prefix="codex-last-msg-") as tmp_dir:
         temp_path = os.path.join(tmp_dir, "out.txt")
         cmd: List[str] = [
@@ -122,12 +185,12 @@ def _codex_exec_with_marker(
             "never",
             "--sandbox",
             sandbox,
-            "exec",
-            "-o",
-            temp_path,
         ]
-        if model:
-            cmd.extend(["--model", model])
+        if effective_effort:
+            cmd.extend(["-c", "model_reasoning_effort={}".format(effective_effort)])
+        cmd.extend(["exec", "-o", temp_path])
+        if effective_model:
+            cmd.extend(["--model", effective_model])
         cmd.append("-")
         log_cmd = cmd[:-1] + ["<codex prompt on stdin>"]
         completed = _run_command(
@@ -164,6 +227,71 @@ def _codex_exec_with_marker(
             # An empty last-message on a failed run is itself one of the
             # documented environmental failure modes, so escalate.
             detail = env_reason or "no partial last-message captured"
+            raise CodexEnvironmentError(
+                "{} [env failure: {}]".format(base_message, detail)
+            )
+        raise CommandError(base_message)
+    marker_value = _extract_yes_no_marker(
+        marker_regex=marker_regex, text=last_message
+    )
+    return marker_value, last_message
+
+
+def _bound_last_message(text: str) -> str:
+    """Apply the same head/tail truncation rule used by the codex temp-file
+    reader so claude's stdout-based last-message doesn't blow up logs or the
+    marker regex when models are chatty.
+    """
+    if len(text) <= CODEX_LAST_MESSAGE_LIMIT:
+        return text
+    head_size = max(0, CODEX_LAST_MESSAGE_LIMIT // 2)
+    tail_size = max(0, CODEX_LAST_MESSAGE_LIMIT - head_size)
+    omitted = len(text) - CODEX_LAST_MESSAGE_LIMIT
+    head = text[:head_size]
+    tail = text[-tail_size:] if tail_size > 0 else ""
+    return "{}...<truncated {} bytes>...{}".format(head, omitted, tail)
+
+
+def _claude_exec_with_marker(
+    *,
+    prompt: str,
+    marker_regex: str,
+    model: Optional[str],
+) -> Tuple[Optional[bool], str]:
+    cmd: List[str] = ["claude", "-p", "--dangerously-skip-permissions"]
+    if model:
+        cmd.extend(["--model", model])
+    log_cmd = cmd + ["<claude prompt on stdin>"]
+    completed = _run_command(
+        cmd,
+        check=False,
+        capture_output=True,
+        input_text=prompt,
+        log_cmd=log_cmd,
+    )
+    raw_stdout = (getattr(completed, "stdout", "") or "").strip()
+    last_message = _bound_last_message(raw_stdout)
+    if completed.returncode != 0:
+        env_reason = _detect_claude_env_failure(
+            getattr(completed, "stdout", "") or "",
+            getattr(completed, "stderr", "") or "",
+            last_message,
+        )
+        if last_message == "":
+            base_message = (
+                "claude exec failed (exit={}) with no output captured.".format(
+                    completed.returncode
+                )
+            )
+        else:
+            base_message = (
+                "claude exec failed (exit={}); marker inference skipped. "
+                "partial output: {}".format(
+                    completed.returncode, _truncate_for_log(last_message)
+                )
+            )
+        if env_reason is not None or last_message == "":
+            detail = env_reason or "no output captured"
             raise CodexEnvironmentError(
                 "{} [env failure: {}]".format(base_message, detail)
             )
@@ -257,21 +385,48 @@ def _parse_addressed_comments(text: str) -> List[Tuple[int, str]]:
     return addressed
 
 
+def _review_invocation_clause(provider: str) -> str:
+    """Return the imperative sentence asking the agent to run a code review.
+
+    Codex has a built-in `/review` slash command; Claude Code does not, so for
+    anthropic we inline an equivalent instruction.
+    """
+    if provider == "anthropic":
+        return (
+            "Perform a thorough code review of the changes on this branch "
+            "(both uncommitted working-tree changes and any branch commits "
+            "not yet on the base). Look for bugs, regressions, security "
+            "issues, missing edge cases, and test gaps."
+        )
+    return "Run `/review`."
+
+
 def _run_review_fix_round(
     round_number: int,
     base: str,
     model: Optional[str],
     external_comments: Optional[List[dict]] = None,
+    *,
+    provider: str = "openai",
+    reasoning_effort: Optional[str] = None,
 ) -> Tuple[bool, List[Tuple[int, str]]]:
-    _print_step("Codex review/fix round {}".format(round_number))
+    _print_step(
+        "Agent review/fix round {} (provider={})".format(round_number, provider)
+    )
     del base
+    review_clause = _review_invocation_clause(provider)
     external_block = ""
     if external_comments:
+        alongside_phrase = (
+            "alongside your code review"
+            if provider == "anthropic"
+            else "alongside /review"
+        )
         external_block = textwrap.dedent(
             """
 
             Existing reviewer comments on this PR (from bots and humans). Treat
-            each as additional findings to consider alongside /review. When you
+            each as additional findings to consider {alongside}. When you
             make a code change that addresses one, emit a block in your final
             response of the form:
 
@@ -289,37 +444,39 @@ def _run_review_fix_round(
 
             Comments:
             """
-        ).rstrip() + "\n" + _format_external_review_comments(external_comments)
+        ).rstrip().format(alongside=alongside_phrase) + "\n" + _format_external_review_comments(external_comments)
     prompt = (
         textwrap.dedent(
             """
-            Run `/review`.
-            If `/review` finds actionable issues, fix them in the current repository.
+            {review_clause}
+            If the review finds actionable issues, fix them in the current repository.
             Do not commit or push.
-            Then run `/review` exactly one more time.
+            Then perform the same review exactly one more time.
             If no actionable issues remain after that second review, end your
             response with the line:
             REVIEW_PASS=yes
             Otherwise end with:
             REVIEW_PASS=no
             """
-        ).strip()
+        ).strip().format(review_clause=review_clause)
         + external_block
     )
     marker_value, last_message = _codex_exec_with_marker(
         prompt=prompt,
         marker_regex=r"REVIEW_PASS=(yes|no)",
         model=model,
+        provider=provider,
+        reasoning_effort=reasoning_effort,
     )
     _print_step(
-        "Codex marker output: {}".format(
+        "Agent marker output: {}".format(
             _truncate_for_log(last_message or "<empty>")
         )
     )
     addressed = _parse_addressed_comments(last_message or "")
     if addressed:
         _print_step(
-            "Codex reported addressing {} reviewer comment(s): {}".format(
+            "Agent reported addressing {} reviewer comment(s): {}".format(
                 len(addressed),
                 ", ".join("#{}".format(cid) for cid, _ in addressed),
             )
@@ -329,7 +486,7 @@ def _run_review_fix_round(
     inferred = _infer_review_pass_without_marker(last_message)
     if inferred is None:
         raise CommandError(
-            "Codex did not return REVIEW_PASS marker and pass/fail could not be inferred."
+            "Agent did not return REVIEW_PASS marker and pass/fail could not be inferred."
         )
     _print_step(
         "REVIEW_PASS marker missing; inferred REVIEW_PASS={} from Codex text.".format(
@@ -339,34 +496,56 @@ def _run_review_fix_round(
     return inferred, addressed
 
 
-def _run_pre_push_review_gate(*, base: str, model: Optional[str]) -> bool:
-    _print_step("Running Codex /review gate before push")
+def _run_pre_push_review_gate(
+    *,
+    base: str,
+    model: Optional[str],
+    provider: str = "openai",
+    reasoning_effort: Optional[str] = None,
+) -> bool:
+    _print_step("Running pre-push review gate (provider={})".format(provider))
     del base
-    prompt = textwrap.dedent(
-        """
-        Run `/review` exactly once and do not modify files.
-        If no actionable issues remain, return:
-        PRE_PUSH_REVIEW_OK=yes
-        Otherwise return:
-        PRE_PUSH_REVIEW_OK=no
-        Respond with exactly one line and nothing else.
-        """
-    ).strip()
+    if provider == "anthropic":
+        prompt = textwrap.dedent(
+            """
+            Perform a thorough code review of the uncommitted/working-tree
+            changes plus any branch commits not yet on the base. Do not modify
+            any files.
+            If no actionable issues remain, return:
+            PRE_PUSH_REVIEW_OK=yes
+            Otherwise return:
+            PRE_PUSH_REVIEW_OK=no
+            Respond with exactly one line and nothing else.
+            """
+        ).strip()
+    else:
+        prompt = textwrap.dedent(
+            """
+            Run `/review` exactly once and do not modify files.
+            If no actionable issues remain, return:
+            PRE_PUSH_REVIEW_OK=yes
+            Otherwise return:
+            PRE_PUSH_REVIEW_OK=no
+            Respond with exactly one line and nothing else.
+            """
+        ).strip()
     marker_value, last_message = _codex_exec_with_marker(
         prompt=prompt,
         marker_regex=r"PRE_PUSH_REVIEW_OK=(yes|no)",
         model=model,
         sandbox="read-only",
+        provider=provider,
+        reasoning_effort=reasoning_effort,
     )
     _print_step(
-        "Codex marker output: {}".format(_truncate_for_log(last_message or "<empty>"))
+        "Agent marker output: {}".format(_truncate_for_log(last_message or "<empty>"))
     )
     if marker_value is not None:
         return marker_value
     inferred = _infer_review_pass_without_marker(last_message)
     if inferred is None:
         raise CommandError(
-            "Codex did not return PRE_PUSH_REVIEW_OK marker and pass/fail could not be inferred."
+            "Agent did not return PRE_PUSH_REVIEW_OK marker and pass/fail could not be inferred."
         )
     _print_step(
         "PRE_PUSH_REVIEW_OK marker missing; inferred PRE_PUSH_REVIEW_OK={} from Codex text.".format(
@@ -381,8 +560,12 @@ def _run_local_quality_fix_round(
     round_number: int,
     failure_summary: str,
     model: Optional[str],
+    provider: str = "openai",
+    reasoning_effort: Optional[str] = None,
 ) -> bool:
-    _print_step("Codex local quality repair round {}".format(round_number))
+    _print_step(
+        "Local quality repair round {} (provider={})".format(round_number, provider)
+    )
     prompt = textwrap.dedent(
         """
         Local quality gates failed before commit/push.
@@ -402,14 +585,16 @@ def _run_local_quality_fix_round(
         prompt=prompt,
         marker_regex=r"LOCAL_QUALITY_FIX_READY=(yes|no)",
         model=model,
+        provider=provider,
+        reasoning_effort=reasoning_effort,
     )
     _print_step(
-        "Codex marker output: {}".format(
+        "Agent marker output: {}".format(
             _truncate_for_log(last_message or "<empty>")
         )
     )
     if marker_value is None:
-        raise CommandError("Codex did not return LOCAL_QUALITY_FIX_READY marker.")
+        raise CommandError("Agent did not return LOCAL_QUALITY_FIX_READY marker.")
     return marker_value
 
 
@@ -418,8 +603,12 @@ def _run_ci_fix_round(
     round_number: int,
     checks: list,
     model: Optional[str],
+    provider: str = "openai",
+    reasoning_effort: Optional[str] = None,
 ) -> bool:
-    _print_step("Codex CI repair round {}".format(round_number))
+    _print_step(
+        "CI repair round {} (provider={})".format(round_number, provider)
+    )
     failing_summary = _format_failing_checks(_failing_check_records(checks))
     prompt = textwrap.dedent(
         """
@@ -440,12 +629,14 @@ def _run_ci_fix_round(
         prompt=prompt,
         marker_regex=r"CI_FIX_READY=(yes|no)",
         model=model,
+        provider=provider,
+        reasoning_effort=reasoning_effort,
     )
     _print_step(
-        "Codex marker output: {}".format(
+        "Agent marker output: {}".format(
             _truncate_for_log(last_message or "<empty>")
         )
     )
     if marker_value is None:
-        raise CommandError("Codex did not return CI_FIX_READY marker.")
+        raise CommandError("Agent did not return CI_FIX_READY marker.")
     return marker_value

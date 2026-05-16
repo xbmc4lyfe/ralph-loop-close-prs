@@ -1,4 +1,5 @@
 import builtins
+import subprocess
 
 import pytest
 
@@ -442,8 +443,10 @@ def test_review_round_surfaces_external_comments_and_parses_addressed(
 ):
     captured = {}
 
-    def fake_exec(*, prompt, marker_regex, model):
+    def fake_exec(*, prompt, marker_regex, model, provider="openai", reasoning_effort=None):
         captured["prompt"] = prompt
+        captured["provider"] = provider
+        captured["reasoning_effort"] = reasoning_effort
         text = (
             "ADDRESSED_COMMENT_START=12345\n"
             "Wrapped the exception handler in _maybe_refresh_caps to redact\n"
@@ -826,8 +829,16 @@ def test_commit_and_push_runs_quality_repair_and_reenables_review_gate(
         )
         == "committed"
     )
-    repair.assert_called_once_with(round_number=1, failure_summary="fail", model="m")
-    review.assert_called_once_with(base="main", model="m")
+    repair.assert_called_once_with(
+        round_number=1,
+        failure_summary="fail",
+        model="m",
+        provider="openai",
+        reasoning_effort=None,
+    )
+    review.assert_called_once_with(
+        base="main", model="m", provider="openai", reasoning_effort=None
+    )
 
 
 def test_commit_and_push_discards_when_quality_repair_cannot_continue(
@@ -880,3 +891,123 @@ def test_commit_and_push_raises_after_quality_repair_rounds_are_exhausted(
             max_local_quality_rounds=1,
             pre_round_sha="abc",
         )
+
+
+# Provider-switching tests
+
+
+def test_resolve_model_returns_per_provider_default_when_unset():
+    assert codex_agent._resolve_model("openai", None) == "gpt-5.5"
+    assert codex_agent._resolve_model("anthropic", None) == "claude-opus-4-7"
+
+
+def test_resolve_model_honors_explicit_override():
+    assert codex_agent._resolve_model("openai", "gpt-4.1") == "gpt-4.1"
+    assert codex_agent._resolve_model("anthropic", "claude-sonnet-4-6") == "claude-sonnet-4-6"
+
+
+def test_resolve_reasoning_effort_defaults_to_xhigh_for_openai():
+    assert codex_agent._resolve_reasoning_effort("openai", None) == "xhigh"
+
+
+def test_resolve_reasoning_effort_honors_explicit_value_for_openai():
+    assert codex_agent._resolve_reasoning_effort("openai", "medium") == "medium"
+
+
+def test_resolve_reasoning_effort_is_none_for_anthropic():
+    assert codex_agent._resolve_reasoning_effort("anthropic", "xhigh") is None
+    assert codex_agent._resolve_reasoning_effort("anthropic", None) is None
+
+
+def test_codex_exec_passes_reasoning_effort_config(monkeypatch, completed_process):
+    seen_cmd = []
+
+    def fake_run(cmd, check, capture_output, **kwargs):
+        seen_cmd.extend(cmd)
+        output_path = cmd[cmd.index("-o") + 1]
+        with open(output_path, "w", encoding="utf-8") as handle:
+            handle.write("REVIEW_PASS=yes\n")
+        return completed_process()
+
+    monkeypatch.setattr(codex_agent, "_run_command", fake_run)
+    codex_agent._codex_exec_with_marker(
+        prompt="p",
+        marker_regex=r"REVIEW_PASS=(yes|no)",
+        model=None,
+        provider="openai",
+    )
+
+    assert "-c" in seen_cmd
+    config_idx = seen_cmd.index("-c")
+    assert seen_cmd[config_idx + 1] == "model_reasoning_effort=xhigh"
+    assert "gpt-5.5" in seen_cmd
+
+
+def test_codex_exec_routes_to_claude_when_provider_is_anthropic(monkeypatch, completed_process):
+    seen_cmd = []
+
+    def fake_run(cmd, check, capture_output, **kwargs):
+        seen_cmd.extend(cmd)
+        return completed_process(stdout="REVIEW_PASS=yes\n")
+
+    monkeypatch.setattr(codex_agent, "_run_command", fake_run)
+    marker, message = codex_agent._codex_exec_with_marker(
+        prompt="p",
+        marker_regex=r"REVIEW_PASS=(yes|no)",
+        model=None,
+        provider="anthropic",
+    )
+
+    assert marker is True
+    assert message == "REVIEW_PASS=yes"
+    assert seen_cmd[0] == "claude"
+    assert "-p" in seen_cmd
+    assert "--dangerously-skip-permissions" in seen_cmd
+    assert "claude-opus-4-7" in seen_cmd
+    # codex-only flags should not appear on the claude path
+    assert "codex" not in seen_cmd
+    assert "--sandbox" not in seen_cmd
+
+
+def test_claude_exec_raises_env_error_on_401(monkeypatch):
+    def fake_run(cmd, check, capture_output, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=1, stdout="", stderr="401 Unauthorized: invalid api key"
+        )
+
+    monkeypatch.setattr(codex_agent, "_run_command", fake_run)
+    with pytest.raises(CodexEnvironmentError, match="env failure"):
+        codex_agent._claude_exec_with_marker(
+            prompt="p",
+            marker_regex=r"REVIEW_PASS=(yes|no)",
+            model="claude-opus-4-7",
+        )
+
+
+def test_review_prompt_uses_claude_friendly_clause_for_anthropic(monkeypatch):
+    captured = {}
+
+    def fake_exec(*, prompt, marker_regex, model, provider="openai", reasoning_effort=None):
+        captured["prompt"] = prompt
+        captured["provider"] = provider
+        return True, "REVIEW_PASS=yes"
+
+    monkeypatch.setattr(codex_agent, "_codex_exec_with_marker", fake_exec)
+    codex_agent._run_review_fix_round(
+        1, "main", None, provider="anthropic"
+    )
+    assert "/review" not in captured["prompt"]
+    assert "thorough code review" in captured["prompt"].lower()
+    assert captured["provider"] == "anthropic"
+
+
+def test_review_prompt_uses_codex_slash_command_for_openai(monkeypatch):
+    captured = {}
+
+    def fake_exec(*, prompt, marker_regex, model, provider="openai", reasoning_effort=None):
+        captured["prompt"] = prompt
+        return True, "REVIEW_PASS=yes"
+
+    monkeypatch.setattr(codex_agent, "_codex_exec_with_marker", fake_exec)
+    codex_agent._run_review_fix_round(1, "main", None)
+    assert "/review" in captured["prompt"]

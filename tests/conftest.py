@@ -36,6 +36,8 @@ def make_args(**overrides):
         "poll_seconds": 1,
         "checks_timeout_seconds": 2,
         "model": None,
+        "provider": "openai",
+        "reasoning_effort": None,
         "skip_rebase": True,
         "skip_merge": True,
         "dry_run": False,

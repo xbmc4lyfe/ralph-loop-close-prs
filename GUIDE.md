@@ -59,6 +59,7 @@ The script expects all of the following:
 - git commit signing is enabled
 - a git signing key is configured
 - the SSH identity files used by the script already exist
+- `RALPH_COAUTHOR_LINE`, if overridden, uses an allowed `Co-Authored-By` email
 
 The script also enforces and/or sets this runtime identity:
 
@@ -71,6 +72,9 @@ Environment overrides for SSH key paths and the worktree root expand a leading
 `~`. `RALPH_SSH_COMMAND` is parsed with normal shell quoting so leading `~`
 path tokens, including `key=~/path` values, can be expanded before writing
 `core.sshCommand`; commands that cannot be parsed are left as provided.
+The co-author trailer email must be the active git email, the built-in
+`oz-agent@warp.dev` co-author, or a comma-separated entry from
+`RALPH_COAUTHOR_ALLOWED_EMAILS`.
 
 ## CLI surface
 
@@ -83,7 +87,9 @@ The script exposes these arguments:
 - `--max-local-quality-rounds <n>`: cap local repair rounds for `just ci` / `just test`; `0` means unbounded
 - `--poll-seconds <n>`: interval for polling GitHub checks
 - `--checks-timeout-seconds <n>`: timeout for one wait-for-checks cycle
-- `--model <name>`: optional Codex model override
+- `--provider <openai|anthropic>`: select which AI provider drives the review/fix loop. Default `openai` invokes the `codex` CLI; `anthropic` invokes the `claude` CLI in print mode with an inlined review prompt that mirrors `/review`
+- `--model <name>`: optional model override. Defaults: `gpt-5.5` for openai, `claude-opus-4-7` for anthropic
+- `--reasoning-effort <none|low|medium|high|xhigh>`: reasoning effort for the OpenAI model, passed as `codex -c model_reasoning_effort=...`. Defaults to `xhigh` for openai; ignored for anthropic
 - `--skip-rebase`: skip the initial and final rebase
 - `--skip-merge`: stop after the branch is green
 - `--dry-run`: resolve and validate the PR, then stop before local or remote mutations
@@ -185,27 +191,33 @@ If `--skip-rebase` is not set, it then performs an initial rebase through `_reba
 
 This means the script may rewrite the PR branch before any review or CI repair work begins.
 
-## Codex execution model
+## Agent execution model
 
-Every Codex-driven round uses `_codex_exec_with_marker(...)`.
+Every agent-driven round uses `_codex_exec_with_marker(...)`. Despite the
+historical name, this helper dispatches by `--provider`:
 
-That helper:
+- `--provider openai` (default): runs `codex exec` with `--ask-for-approval
+  never`, `-c model_reasoning_effort=<effort>` (default `xhigh`), and
+  `--model gpt-5.5` (the default). Codex writes its final response to a temp
+  file via `-o`, which is then read back and scanned for the yes/no marker.
+- `--provider anthropic`: routes to `_claude_exec_with_marker(...)`, which
+  runs `claude -p --dangerously-skip-permissions --model claude-opus-4-7`.
+  The prompt replaces Codex's `/review` slash command with an inlined
+  "perform a thorough code review" instruction since Claude Code has no
+  `/review` in print mode. The marker is parsed out of the bounded stdout.
 
-1. Creates a temporary directory.
-2. Runs `codex exec` with `--ask-for-approval never`.
-3. Writes Codex's final response to a temp file via `-o`.
-4. Reads the file back.
-5. Extracts a yes/no marker from the final message with `_extract_yes_no_marker(...)`.
+In both cases the prompt is passed on stdin and command logging replaces the
+stdin marker with `<codex prompt on stdin>` / `<claude prompt on stdin>` so
+review comments, failure summaries, and private URLs are not printed into
+Ralph logs as one giant command line.
 
-The prompt is passed to Codex on stdin, and command logging replaces the stdin
-marker with `<codex prompt on stdin>` so review comments, failure summaries, and
-private URLs are not printed into Ralph logs as one giant command line.
+If either CLI exits non-zero, the helper raises `CommandError` (or
+`CodexEnvironmentError` for matched environmental failure patterns) before
+marker extraction. A captured last-message / partial stdout may be included
+in the error for diagnostics, but it is not trusted as a successful marker
+response.
 
-If `codex exec` exits non-zero, the helper raises `CommandError` before marker
-extraction. A captured last-message may be included in the error for
-diagnostics, but it is not trusted as a successful marker response.
-
-The markers are how the outer loop decides whether Codex believes a round passed or produced a usable fix.
+The markers are how the outer loop decides whether the agent believes a round passed or produced a usable fix.
 
 The script currently uses `danger-full-access` sandbox mode for these Codex runs.
 
@@ -415,9 +427,13 @@ If `--skip-merge` is not set, the script finishes by:
 
 1. captures the current `HEAD` SHA
 2. signs off / approves the PR if needed
-3. runs `gh pr merge <pr> --rebase --delete-branch --match-head-commit <sha>`
+3. runs `gh pr merge <pr> --rebase --match-head-commit <sha>`
+4. after a successful merge, tries to delete the PR head branch through the GitHub API
 
 That `--match-head-commit` guard makes the merge conditional on the head SHA still matching the local expectation.
+Branch deletion is intentionally separate from `gh pr merge` so local git
+worktree branch exclusivity cannot make a completed remote merge look failed
+while `gh` is trying to clean up the branch locally.
 
 ## How retries work
 
