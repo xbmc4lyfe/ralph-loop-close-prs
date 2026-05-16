@@ -215,7 +215,7 @@ repo_is_clean() {
 
 codex_usage_limited() {
     local log_file="$1"
-    grep -Eiq 'usage limit|purchase more credits|try again at' "$log_file" 2>/dev/null
+    grep -Eiq 'usage limit|purchase more credits|try again at|exceeded retry limit|429 Too Many Requests|401 Unauthorized|invalid api key|Missing bearer or basic authentication|502 Bad Gateway' "$log_file" 2>/dev/null
 }
 
 monotonic_millis() {

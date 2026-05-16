@@ -568,6 +568,78 @@ exit 1
         subprocess.run([str(script), "stop"], env=env, stdout=subprocess.PIPE, text=True)
 
 
+def test_retry_limit_response_backs_off_instead_of_advancing(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "run-ralph-random-repos-forever.sh"
+    search_root = tmp_path / "repos"
+    source_repo = search_root / "sample"
+    log_dir = tmp_path / "logs"
+    prompt = tmp_path / "prompt.md"
+    fake_bin = tmp_path / "bin"
+    out_file = log_dir / "random-repos-forever.out"
+
+    source_repo.mkdir(parents=True)
+    _run(["git", "init"], cwd=str(source_repo), stdout=subprocess.DEVNULL)
+    (source_repo / "README.md").write_text("sample\n")
+    _run(["git", "add", "README.md"], cwd=str(source_repo))
+    _run(
+        [
+            "git",
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+        cwd=str(source_repo),
+        stdout=subprocess.DEVNULL,
+    )
+
+    prompt.write_text("fake prompt\n")
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "codex",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf 'ERROR: exceeded retry limit, last status: 429 Too Many Requests\\n'
+printf 'failed to connect to websocket: HTTP error: 502 Bad Gateway\\n'
+exit 1
+""",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": str(fake_bin) + os.pathsep + env.get("PATH", ""),
+            "RALPH_RANDOM_LOG_DIR": str(log_dir),
+            "RALPH_RANDOM_ROOT": str(source_repo),
+            "RALPH_RANDOM_PROMPT_FILE": str(prompt),
+            "RALPH_RANDOM_SECONDS": "5",
+            "RALPH_RANDOM_SLEEP_SECONDS": "1",
+            "RALPH_RANDOM_USAGE_LIMIT_SLEEP_SECONDS": "60",
+            "RALPH_RANDOM_AGENT_ID": "test-agent",
+        }
+    )
+
+    try:
+        _run([str(script), "start"], env=env, stdout=subprocess.PIPE)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if out_file.exists() and "codex_usage_limited iteration=1; sleeping 60s" in out_file.read_text():
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("runner did not back off after Codex retry exhaustion")
+
+        time.sleep(1.5)
+        out = out_file.read_text()
+        assert "selecting_repo iteration=2" not in out
+    finally:
+        subprocess.run([str(script), "stop"], env=env, stdout=subprocess.PIPE, text=True)
+
+
 def test_setup_timeout_prevents_codex_from_starting(tmp_path):
     repo_root = Path(__file__).resolve().parents[1]
     script = repo_root / "run-ralph-random-repos-forever.sh"
