@@ -75,16 +75,20 @@ def _reset_generated_changes(target_sha: Optional[str] = None):
     head_sha = _git_head_sha()
     dirty = _working_tree_dirty()
     if not dirty and target_sha and head_sha == target_sha:
+        _print_step("Cleaning generated files (git clean -fdx)")
+        _run_command(["git", "clean", "-fdx"], check=True, capture_output=True)
         return
     if not dirty and not target_sha:
+        _print_step("Cleaning generated files (git clean -fdx)")
+        _run_command(["git", "clean", "-fdx"], check=True, capture_output=True)
         return
     _print_step(
-        "Resetting generated changes (git reset --hard {} + git clean -fd)".format(
+        "Resetting generated changes (git reset --hard {} + git clean -fdx)".format(
             target
         )
     )
     _run_command(["git", "reset", "--hard", target], check=True, capture_output=True)
-    _run_command(["git", "clean", "-fd"], check=True, capture_output=True)
+    _run_command(["git", "clean", "-fdx"], check=True, capture_output=True)
 
 
 def _rebase_onto_base(branch: str, base: str):

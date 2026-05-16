@@ -35,10 +35,6 @@ class _LoopLock:
                 self.handle.close()
             except OSError:
                 pass
-            try:
-                os.unlink(self.path)
-            except OSError:
-                pass
 
 
 def _acquire_loop_lock(
@@ -53,6 +49,8 @@ def _acquire_loop_lock(
     lock_path = os.path.join(
         tempfile.gettempdir(), "codex-ralph-loop-{}.lock".format(key)
     )
+    if os.path.islink(lock_path):
+        raise CommandError("Refusing to use symlink as Ralph lock file: {}".format(lock_path))
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
     handle = os.fdopen(fd, "r+", encoding="utf-8")
     try:
@@ -138,6 +136,82 @@ def _worktree_for_branch(branch: str) -> Optional[str]:
     return None
 
 
+def _worktree_path_is_registered(path: str) -> bool:
+    completed = _run_command(
+        ["git", "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+    )
+    expected = os.path.abspath(path)
+    for line in (completed.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            if os.path.abspath(line[len("worktree ") :]) == expected:
+                return True
+    return False
+
+
+def _ensure_worktree_origin_matches(path: str):
+    source_origin = _run_command(
+        ["git", "remote", "get-url", "origin"],
+        check=True,
+        capture_output=True,
+    )
+    worktree_origin = _run_command(
+        ["git", "-C", path, "remote", "get-url", "origin"],
+        check=True,
+        capture_output=True,
+    )
+    if (source_origin.stdout or "").strip() != (worktree_origin.stdout or "").strip():
+        raise CommandError(
+            "Existing worktree {} origin remote does not match the launching repo.".format(
+                path
+            )
+        )
+
+
+def _sync_existing_worktree(*, path: str, start_ref: str):
+    status = _run_command(
+        ["git", "-C", path, "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+    )
+    if (status.stdout or "").strip():
+        raise CommandError(
+            "Existing PR worktree {} is dirty; refusing to reset it.".format(path)
+        )
+    head = _run_command(
+        ["git", "-C", path, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+    )
+    head_sha = (head.stdout or "").strip()
+    ancestor = _run_command(
+        ["git", "-C", path, "merge-base", "--is-ancestor", head_sha, start_ref],
+        check=False,
+        capture_output=True,
+    )
+    if ancestor.returncode != 0:
+        raise CommandError(
+            "Existing PR worktree {} is not an ancestor of {}; refusing to drop local commits.".format(
+                path, start_ref
+            )
+        )
+    _run_command(
+        ["git", "-C", path, "reset", "--hard", start_ref],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _local_branch_exists(branch: str) -> bool:
+    result = _run_command(
+        ["git", "show-ref", "--verify", "--quiet", "refs/heads/{}".format(branch)],
+        check=False,
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
 def _ensure_pr_worktree(
     *,
     worktree_root: str,
@@ -155,19 +229,25 @@ def _ensure_pr_worktree(
     if existing_branch_worktree and os.path.abspath(
         existing_branch_worktree
     ) != os.path.abspath(path):
+        sys.stdout.write("{}\n".format(LOOP_ALREADY_RUNNING_MESSAGE))
+        sys.stdout.flush()
         _print_step(
-            "PR branch '{}' is already checked out at {}; reusing it".format(
-                branch, existing_branch_worktree
+            "PR branch '{}' is already checked out at {}; refusing to run outside {}".format(
+                branch,
+                existing_branch_worktree,
+                path,
             )
         )
-        _fetch_pr_branch_or_head(
-            pr_number=pr_number,
-            branch=branch,
-            cwd=existing_branch_worktree,
-        )
-        return existing_branch_worktree
+        raise SystemExit(0)
     if os.path.isdir(path):
         _print_step("Using existing PR worktree {}".format(path))
+        if not _worktree_path_is_registered(path):
+            raise CommandError(
+                "Existing worktree path {} is not registered for the launching repo.".format(
+                    path
+                )
+            )
+        _ensure_worktree_origin_matches(path)
         worktree_branch = _run_command(
             ["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
             check=True,
@@ -181,11 +261,15 @@ def _ensure_pr_worktree(
                     branch,
                 )
             )
-        _fetch_pr_branch_or_head(pr_number=pr_number, branch=branch, cwd=path)
+        _sync_existing_worktree(path=path, start_ref=start_ref)
         return path
     _print_step("Creating PR worktree {}".format(path))
+    if _local_branch_exists(branch):
+        add_cmd = ["git", "worktree", "add", path, branch]
+    else:
+        add_cmd = ["git", "worktree", "add", path, "-b", branch, start_ref]
     result = _run_command(
-        ["git", "worktree", "add", path, "-B", branch, start_ref],
+        add_cmd,
         check=False,
         capture_output=True,
     )

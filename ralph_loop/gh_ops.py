@@ -10,7 +10,12 @@ from typing import Sequence, Tuple
 from .config import NEEDS_REVIEW_LABEL, SSH_SIGNING_KEY
 from .errors import CommandError
 from .git_ops import _git_head_sha
-from .process import _print_step, _printable_cmd, _run_command
+from .process import (
+    _print_step,
+    _printable_cmd,
+    _remaining_command_timeout,
+    _run_command,
+)
 
 _GH_TRANSIENT_MARKERS = (
     "timeout",
@@ -29,6 +34,12 @@ _GH_TRANSIENT_MARKERS = (
 )
 
 
+def _sleep_with_command_deadline(seconds: float, reason: str):
+    remaining = _remaining_command_timeout(reason)
+    delay = seconds if remaining is None else min(seconds, remaining)
+    time.sleep(delay)
+
+
 def _gh_run_with_retry(
     args: Sequence[str],
     *,
@@ -40,7 +51,12 @@ def _gh_run_with_retry(
     cmd = ["gh"] + list(args)
     last_completed = None
     for attempt in range(1, max_attempts + 1):
-        completed = _run_command(cmd, check=False, capture_output=capture_output)
+        completed = _run_command(
+            cmd,
+            check=False,
+            capture_output=capture_output,
+            max_output_bytes=None if capture_output else None,
+        )
         last_completed = completed
         if completed.returncode == 0:
             return completed
@@ -53,7 +69,7 @@ def _gh_run_with_retry(
                     attempt, max_attempts, delay
                 )
             )
-            time.sleep(delay)
+            _sleep_with_command_deadline(delay, "gh retry backoff")
             continue
         break
     if check and last_completed is not None and last_completed.returncode != 0:
@@ -80,11 +96,16 @@ def _gh_json(args: Sequence[str]):
         ) from exc
 
 
-def _gh_json_allow_empty(args: Sequence[str], *, empty_error_text: str = ""):
+def _gh_json_allow_empty(
+    args: Sequence[str],
+    *,
+    empty_error_text: str = "",
+    pending_on_exit_8: bool = False,
+):
     completed = _gh_run_with_retry(args, check=False, capture_output=True)
     raw = (completed.stdout or "").strip()
     stderr_text = (completed.stderr or "").strip()
-    if completed.returncode in (0, 8):
+    if completed.returncode == 0:
         if not raw:
             return []
         try:
@@ -93,9 +114,28 @@ def _gh_json_allow_empty(args: Sequence[str], *, empty_error_text: str = ""):
             raise CommandError(
                 "Failed to parse JSON from gh command: {}".format(exc)
             ) from exc
-    if empty_error_text and (
-        empty_error_text in stderr_text or empty_error_text in raw
-    ):
+    if completed.returncode == 8 and pending_on_exit_8:
+        if raw:
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise CommandError(
+                    "Failed to parse JSON from gh command: {}".format(exc)
+                ) from exc
+        return [
+            {
+                "name": "GitHub checks",
+                "bucket": "pending",
+                "state": "PENDING",
+                "link": "",
+                "workflow": "",
+            }
+        ]
+    empty_markers = ["no checks reported", "no required checks reported"]
+    if empty_error_text:
+        empty_markers.append(empty_error_text)
+    combined_text = "{}\n{}".format(stderr_text, raw).lower()
+    if any(marker and marker in combined_text for marker in empty_markers):
         return []
     raise CommandError(
         "gh command failed (exit={}): {}".format(
@@ -111,20 +151,47 @@ def _active_gh_user() -> str:
     return (completed.stdout or "").strip()
 
 
+_REVIEW_STATES_THAT_SET_APPROVAL = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+
+
+def _review_commit_oid(review: dict) -> str:
+    commit = review.get("commit")
+    if isinstance(commit, dict):
+        value = commit.get("oid") or commit.get("abbreviatedOid")
+        if isinstance(value, str):
+            return value
+    if isinstance(commit, str):
+        return commit
+    for key in ("commitOid", "commitOID"):
+        value = review.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
 def _pr_has_user_approval(pr_ref: str, login: str) -> bool:
-    pr_data = _gh_json(["pr", "view", pr_ref, "--json", "reviews"])
-    for review in pr_data.get("reviews", []):
+    pr_data = _gh_json(["pr", "view", pr_ref, "--json", "reviews,headRefOid"])
+    head_oid = pr_data.get("headRefOid")
+    if not isinstance(head_oid, str):
+        head_oid = ""
+    for review in reversed(pr_data.get("reviews") or []):
         author = (review.get("author") or {}).get("login")
         state = (review.get("state") or "").upper()
-        if author == login and state == "APPROVED":
-            return True
+        if author != login or state not in _REVIEW_STATES_THAT_SET_APPROVAL:
+            continue
+        if state != "APPROVED":
+            return False
+        review_oid = _review_commit_oid(review)
+        if head_oid and review_oid and review_oid != head_oid:
+            return False
+        return True
     return False
 
 
 def _mark_pr_needs_review(pr_ref: str):
     _print_step("Marking PR {} as '{}'".format(pr_ref, NEEDS_REVIEW_LABEL))
-    edit_result = _run_command(
-        ["gh", "pr", "edit", pr_ref, "--add-label", NEEDS_REVIEW_LABEL],
+    edit_result = _gh_run_with_retry(
+        ["pr", "edit", pr_ref, "--add-label", NEEDS_REVIEW_LABEL],
         check=False,
         capture_output=True,
     )
@@ -136,9 +203,8 @@ def _mark_pr_needs_review(pr_ref: str):
             "Failed to set '{}' label on PR {}.".format(NEEDS_REVIEW_LABEL, pr_ref)
         )
     _print_step("Creating missing label '{}'".format(NEEDS_REVIEW_LABEL))
-    create_result = _run_command(
+    create_result = _gh_run_with_retry(
         [
-            "gh",
             "label",
             "create",
             NEEDS_REVIEW_LABEL,
@@ -161,32 +227,47 @@ def _mark_pr_needs_review(pr_ref: str):
                     (create_result.stderr or create_result.stdout or "").strip(),
                 )
             )
-    _run_command(
-        ["gh", "pr", "edit", pr_ref, "--add-label", NEEDS_REVIEW_LABEL],
+    _gh_run_with_retry(
+        ["pr", "edit", pr_ref, "--add-label", NEEDS_REVIEW_LABEL],
         check=True,
         capture_output=True,
     )
 
 
-def _sign_off_pr(pr_ref: str):
+def _sign_off_pr(pr_ref: str, head_sha: str = ""):
     gh_user = _active_gh_user()
     if _pr_has_user_approval(pr_ref, gh_user):
         _print_step("PR {} already approved by {}".format(pr_ref, gh_user))
         return
     _print_step("Submitting PR approval as {}".format(gh_user))
-    result = _run_command(
-        [
-            "gh",
-            "pr",
-            "review",
-            pr_ref,
-            "--approve",
-            "--body",
-            "Automated sign-off before merge.",
-        ],
-        check=False,
-        capture_output=True,
-    )
+    if head_sha:
+        result = _gh_run_with_retry(
+                [
+                    "api",
+                    "repos/{{owner}}/{{repo}}/pulls/{}/reviews".format(pr_ref),
+                "-f",
+                "event=APPROVE",
+                "-f",
+                "commit_id={}".format(head_sha),
+                "-f",
+                "body=Automated sign-off before merge.",
+            ],
+            check=False,
+            capture_output=True,
+        )
+    else:
+        result = _gh_run_with_retry(
+            [
+                "pr",
+                "review",
+                pr_ref,
+                "--approve",
+                "--body",
+                "Automated sign-off before merge.",
+            ],
+            check=False,
+            capture_output=True,
+        )
     if result.returncode == 0:
         return
     stderr = "{}\n{}".format(result.stdout or "", result.stderr or "").lower()
@@ -199,7 +280,6 @@ def _sign_off_pr(pr_ref: str):
 
 def _prepare_pr_for_merge(pr_ref: str):
     _mark_pr_needs_review(pr_ref)
-    _sign_off_pr(pr_ref)
     _run_command(["git", "config", "gpg.format", "ssh"], check=True, capture_output=True)
     _run_command(
         ["git", "config", "user.signingkey", SSH_SIGNING_KEY],
@@ -218,7 +298,7 @@ def _pr_view(pr_ref: str) -> dict:
             "view",
             pr_ref,
             "--json",
-            "number,url,state,headRefName,baseRefName,isDraft",
+            "number,url,state,headRefName,baseRefName,isDraft,isCrossRepository",
         ]
     )
     if not isinstance(data, dict):
@@ -238,6 +318,7 @@ def _pr_checks(branch: str, required_only: bool):
     return _gh_json_allow_empty(
         args,
         empty_error_text="no required checks reported",
+        pending_on_exit_8=True,
     )
 
 
@@ -248,13 +329,24 @@ def _required_checks(branch: str) -> Tuple[list, bool]:
     return _pr_checks(branch, required_only=False), False
 
 
+def _ensure_pr_head_matches_local(pr_ref: str, head_sha: str):
+    pr_data = _gh_json(["pr", "view", pr_ref, "--json", "headRefOid"])
+    remote_head = pr_data.get("headRefOid")
+    if remote_head != head_sha:
+        raise CommandError(
+            "PR {} head is {} but local HEAD is {}; refusing to approve or merge stale code.".format(
+                pr_ref, remote_head or "<unknown>", head_sha
+            )
+        )
+
+
 def _merge_pr(pr_ref: str):
     head_sha = _git_head_sha()
-    _sign_off_pr(pr_ref)
+    _ensure_pr_head_matches_local(pr_ref, head_sha)
+    _sign_off_pr(pr_ref, head_sha=head_sha)
     _print_step("Merging PR with rebase strategy")
-    _run_command(
+    _gh_run_with_retry(
         [
-            "gh",
             "pr",
             "merge",
             pr_ref,

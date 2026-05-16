@@ -18,8 +18,8 @@ For a full end-to-end walkthrough of the current behavior, see `GUIDE.md`.
   orchestration.
 - `ralph_loop/config.py`: environment-derived defaults and fixed labels.
 - `ralph_loop/errors.py`: shared `CommandError`.
-- `ralph_loop/process.py`: subprocess execution, command rendering, step
-  logging, and output formatting.
+- `ralph_loop/process.py`: subprocess execution, command rendering, deadline
+  enforcement, step logging, and bounded output formatting.
 - `ralph_loop/git_ops.py`: git branch, config, status, reset, and rebase
   helpers.
 - `ralph_loop/gh_ops.py`: GitHub CLI retry, JSON, PR metadata, labels, reviews,
@@ -34,7 +34,9 @@ For a full end-to-end walkthrough of the current behavior, see `GUIDE.md`.
 - `ralph_loop/quality.py`: local `just ci` / `just test` gates and commit/push
   retry flow.
 - `ralph_loop/runtime.py`: wall-clock deadline and round-number helpers.
-- `tests/test_helpers.py`: focused unit coverage for pure helper behavior.
+- `tests/`: pytest coverage for CLI orchestration, Codex prompts, local quality
+  gates, git/GitHub helpers, identity setup, process handling, worktrees,
+  check polling, and pure helper behavior.
 - `GUIDE.md`: longer control-flow and safety walkthrough.
 - Running the script or tests can create local `__pycache__/` directories.
 
@@ -65,6 +67,7 @@ The script has several baked-in assumptions. It is not generic.
 - `git config user.email` must be `xbmc4lyfe@users.noreply.github.com`
 - `git config commit.gpgsign` must be enabled
 - `git user.signingkey` must already be configured
+- the PR must not be a fork PR; Ralph pushes fixes to `origin <branch>`
 - The following files must exist:
   - `/Users/allen/.ssh/id_ed25519_xbmc4lyfe`
   - `/Users/allen/.ssh/id_ed25519_signing.pub`
@@ -74,6 +77,11 @@ The script also sets:
 - `git config user.name xbmc4lyfe`
 - `git config user.email xbmc4lyfe@users.noreply.github.com`
 - `git config core.sshCommand "ssh -i /Users/allen/.ssh/id_ed25519_xbmc4lyfe -o IdentitiesOnly=yes -o IdentityAgent=none"`
+
+Environment path overrides such as `RALPH_SSH_AUTH_KEY`,
+`RALPH_SSH_SIGNING_KEY`, and `RALPH_WORKTREE_ROOT` expand a leading `~`.
+Path tokens inside `RALPH_SSH_COMMAND` are also expanded when the command can be
+parsed with normal shell quoting.
 
 ## Worktree Behavior
 
@@ -87,8 +95,9 @@ The worktree path format is:
 
 The script:
 
-- reuses an existing worktree for the branch if one already exists
-- acquires a per-PR lock at `/tmp/codex-ralph-loop-pr-<pr-number>.lock`
+- reuses the expected dedicated worktree path if it already exists
+- exits cleanly if the PR branch is checked out in any other worktree
+- acquires a persistent per-PR advisory lock at `/tmp/codex-ralph-loop-pr-<pr-number>.lock`
 - changes into the PR worktree before doing repair work
 
 ## Local Quality Gates
@@ -99,6 +108,8 @@ Before committing and pushing generated changes, the script runs:
 - `just test`
 
 If either fails, it asks Codex to repair the local failure before retrying.
+The global wall-clock cap is checked during this repair flow, and subprocesses
+are interrupted when the remaining wall-clock budget expires.
 
 If generated changes are considered not useful, it resets the worktree with:
 
@@ -106,6 +117,13 @@ If generated changes are considered not useful, it resets the worktree with:
 - `git clean -fd`
 
 That behavior is destructive inside the PR worktree.
+
+## GitHub Check Waiting
+
+Ralph waits for GitHub checks to appear and finish before treating a branch as
+green. Empty check results and `gh pr checks` exit code 8 are treated as pending
+state, not success. If checks never appear or never leave pending state before
+`--checks-timeout-seconds`, the run stops with an error.
 
 ## Merge Behavior
 
@@ -125,7 +143,7 @@ python3 codex_ralph_wiggum_loop.py --help
 
 Important flags:
 
-- `--pr <number>`: target PR number
+- `--pr <number>`: target a positive PR number
 - `--base <branch>`: base branch, default `main`
 - `--max-review-rounds <n>`: limit review/fix rounds, `0` means unlimited
 - `--max-ci-rounds <n>`: limit CI repair rounds, `0` means unlimited
@@ -135,8 +153,13 @@ Important flags:
 - `--model <name>`: pass a model override to `codex exec`
 - `--skip-rebase`: skip both the initial and final rebase steps
 - `--skip-merge`: stop after CI is green without merging
+- `--dry-run`: resolve and validate the PR, then stop before local or remote mutations
 - `--worktree-root <path>`: override the worktree root
-- `--max-wall-clock-seconds <n>`: cap total runtime, `0` means unlimited
+- `--max-wall-clock-seconds <n>`: cap total runtime, including subprocesses and local quality repair, `0` means unlimited
+
+`--dry-run` is a safe preflight mode. It does not update git config, create or
+reuse worktrees, add labels, run Codex, run quality gates, rebase, push, reset,
+approve, merge, or delete branches.
 
 Example:
 
@@ -149,13 +172,11 @@ python3 codex_ralph_wiggum_loop.py --pr 123 --base main --skip-merge
 - If you do not pass `--pr`, the script uses the current branch name as the PR reference.
 - The CLI remains available through `codex_ralph_wiggum_loop.py`.
 - The only generated artifact currently seen in the repo is `__pycache__/`.
+- Captured subprocess stdout/stderr are bounded and truncated before being
+  returned or replayed to logs.
 
 ## Small TODO
 
-- Expand tests around `ralph_loop.cli.main()` with mocked GitHub, git, Codex,
-  and `just` helpers so the module split has coverage for the full orchestration
-  path without touching a real PR.
-- Add `.gitignore` entries for local artifacts such as `__pycache__/`,
-  `.DS_Store`, `.coverage`, and `.ruff_cache/`.
-- Decide whether the older monolith-focused untracked tests should be rewritten
-  against the new module boundaries or removed.
+- Continue hardening the high-impact behaviors tracked in `BUGS.md`.
+- Add broader integration-style coverage for git/GitHub edge cases with mocks
+  or a safe dry-run path before using a real PR.

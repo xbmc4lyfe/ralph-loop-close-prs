@@ -11,14 +11,22 @@ from .checks import _failing_check_records, _format_failing_checks
 from .errors import CommandError
 from .process import _print_step, _run_command, _truncate_for_log
 
+
+CODEX_LAST_MESSAGE_LIMIT = 4000
+
+
 def _extract_yes_no_marker(*, marker_regex: str, text: str) -> Optional[bool]:
-    matches = re.findall(marker_regex, text, flags=re.IGNORECASE)
-    if not matches:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
         return None
-    last = matches[-1]
-    if isinstance(last, tuple):
-        last = next((g for g in last if g), "")
-    return last.lower() == "yes"
+    match = re.fullmatch(marker_regex, lines[0], flags=re.IGNORECASE)
+    if not match:
+        return None
+    values = match.groups() or (match.group(0),)
+    for value in reversed(values):
+        if isinstance(value, str) and value.lower() in ("yes", "no"):
+            return value.lower() == "yes"
+    return None
 
 
 def _codex_exec_with_marker(
@@ -46,7 +54,10 @@ def _codex_exec_with_marker(
         completed = _run_command(cmd, check=False, capture_output=True)
         try:
             with open(temp_path, "r", encoding="utf-8") as handle:
-                last_message = handle.read().strip()
+                last_message = _truncate_for_log(
+                    handle.read().strip(),
+                    CODEX_LAST_MESSAGE_LIMIT,
+                )
         except FileNotFoundError:
             last_message = ""
     if completed.returncode != 0:
@@ -56,9 +67,10 @@ def _codex_exec_with_marker(
                     completed.returncode
                 )
             )
-        _print_step(
-            "codex exec exited {} but produced a last-message; continuing with marker inference.".format(
-                completed.returncode
+        raise CommandError(
+            "codex exec failed (exit={}); marker inference skipped. "
+            "partial last-message: {}".format(
+                completed.returncode, _truncate_for_log(last_message)
             )
         )
     marker_value = _extract_yes_no_marker(
@@ -69,10 +81,21 @@ def _codex_exec_with_marker(
 
 def _infer_review_pass_without_marker(last_message: str) -> Optional[bool]:
     text = last_message.lower()
-    if re.search(r"\b(no findings|no actionable issues remain|no issues found)\b", text):
-        return True
-    if re.search(r"\b(actionable issues remain|findings remain|issues remain)\b", text):
+    failure_text = re.sub(
+        r"\b(no actionable issues remain|no issues remain)\b",
+        "",
+        text,
+    )
+    if re.search(
+        r"\b(actionable issues remain|findings remain|issues remain)\b",
+        failure_text,
+    ):
         return False
+    if re.search(
+        r"\b(no findings|no actionable issues remain|no issues found|no issues remain)\b",
+        text,
+    ):
+        return True
     return None
 
 
@@ -82,6 +105,7 @@ def _run_review_fix_round(round_number: int, base: str, model: Optional[str]) ->
         """
         Run `/review --base {base}`.
         If `/review` finds actionable issues, fix them in the current repository.
+        Do not commit or push.
         Then run `/review --base {base}` exactly one more time.
         If no actionable issues remain after that second review, return:
         REVIEW_PASS=yes
@@ -131,6 +155,7 @@ def _run_pre_push_review_gate(*, base: str, model: Optional[str]) -> bool:
         prompt=prompt,
         marker_regex=r"PRE_PUSH_REVIEW_OK=(yes|no)",
         model=model,
+        sandbox="read-only",
     )
     _print_step(
         "Codex marker output: {}".format(_truncate_for_log(last_message or "<empty>"))

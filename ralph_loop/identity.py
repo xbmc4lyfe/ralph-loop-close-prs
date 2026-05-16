@@ -85,6 +85,21 @@ def _ensure_runtime_identity():
         raise CommandError(
             "gh is authenticated as '{}' instead of '{}'.".format(gh_login, GH_USER)
         )
+    origin = _run_command(
+        ["git", "remote", "get-url", "origin"],
+        check=True,
+        capture_output=True,
+    )
+    origin_url = (origin.stdout or "").strip()
+    if not (
+        origin_url.startswith("git@")
+        or origin_url.startswith("ssh://")
+    ):
+        raise CommandError(
+            "origin remote must use SSH so Ralph pushes with the configured SSH identity: {}".format(
+                origin_url or "<empty>"
+            )
+        )
     _print_step(
         "Setting git identity and SSH/signing keys for '{}'".format(GH_USER)
     )

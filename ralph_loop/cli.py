@@ -6,7 +6,7 @@ import os
 import signal
 import sys
 import time
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 from .checks import _wait_for_required_checks_green
 from .codex_agent import _run_ci_fix_round, _run_review_fix_round
@@ -21,7 +21,7 @@ from .git_ops import (
     _working_tree_dirty,
 )
 from .identity import _ensure_runtime_identity, _validate_identity_and_signing
-from .process import _print_step
+from .process import _print_step, _set_command_deadline
 from .quality import _commit_and_push
 from .runtime import _check_wall_clock, _round_numbers
 from .worktrees import _acquire_loop_lock, _ensure_pr_worktree
@@ -60,7 +60,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pr",
-        type=int,
+        type=_pos_int,
         default=None,
         help="Target PR number. If provided, run against that PR and its head branch.",
     )
@@ -116,6 +116,14 @@ def _parse_args() -> argparse.Namespace:
         help="Stop after CI is green (and optional rebase), without merging.",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Resolve and validate the PR, then stop before identity changes, "
+            "worktree setup, Codex, quality gates, rebase, push, approval, or merge."
+        ),
+    )
+    parser.add_argument(
         "--worktree-root",
         default=DEFAULT_WORKTREE_ROOT,
         help="Directory where per-PR git worktrees are created.",
@@ -126,11 +134,82 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help=(
             "Global wall-clock timeout (seconds) for the entire run. Enforced "
-            "at the top of each review/CI loop iteration and inside required-"
-            "check polling. Use 0 for unlimited (the default)."
+            "at review/CI loop boundaries, local-quality repair boundaries, "
+            "subprocesses, and required-check polling. Use 0 for unlimited "
+            "(the default)."
         ),
     )
     return parser.parse_args()
+
+
+def _resolve_pr_data(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
+    if args.pr is not None:
+        pr_ref = str(args.pr)
+    else:
+        current_branch = _git_branch()
+        if current_branch.isdigit():
+            raise CommandError(
+                "Current branch has numeric branch name '{}'; pass --pr explicitly "
+                "to avoid ambiguity with GitHub PR numbers.".format(current_branch)
+            )
+        pr_ref = current_branch
+    pr_data = _pr_view(pr_ref)
+    pr_number = pr_data.get("number")
+    if not isinstance(pr_number, int):
+        raise CommandError("Could not resolve PR number for '{}'.".format(pr_ref))
+    return pr_data, pr_number
+
+
+def _validate_pr_metadata(
+    pr_data: Dict[str, Any], pr_number: int, expected_base: str
+) -> str:
+    if pr_data.get("state") != "OPEN":
+        raise CommandError(
+            "PR {} is not open (state={}).".format(
+                pr_number, pr_data.get("state")
+            )
+        )
+    if pr_data.get("isDraft"):
+        raise CommandError(
+            "PR is in draft state; mark it ready before merge automation."
+        )
+    if pr_data.get("isCrossRepository"):
+        raise CommandError(
+            "fork PRs are not supported because Ralph pushes fixes to origin/<branch>."
+        )
+    pr_base = pr_data.get("baseRefName")
+    if pr_base and pr_base != expected_base:
+        raise CommandError(
+            "PR #{} targets base '{}' but --base is '{}'. Use the PR base branch.".format(
+                pr_number, pr_base, expected_base
+            )
+        )
+
+    branch = pr_data.get("headRefName")
+    if not branch:
+        raise CommandError("Could not resolve PR head branch.")
+    if branch == expected_base:
+        raise CommandError(
+            "PR head branch '{}' matches base '{}'; aborting.".format(
+                branch, expected_base
+            )
+        )
+    return branch
+
+
+def _run_dry_run(args: argparse.Namespace) -> int:
+    pr_data, pr_number = _resolve_pr_data(args)
+    branch = _validate_pr_metadata(pr_data, pr_number, args.base)
+    _print_step(
+        "Dry run: validated PR #{} {} on branch '{}' targeting base '{}'.".format(
+            pr_number, pr_data.get("url", ""), branch, args.base
+        )
+    )
+    _print_step(
+        "Dry run: stopped before identity changes, worktree setup, Codex, "
+        "quality gates, rebase, push, reset, approval, merge, or branch deletion."
+    )
+    return 0
 
 
 def main() -> int:
@@ -142,6 +221,7 @@ def main() -> int:
         if args.max_wall_clock_seconds > 0
         else None
     )
+    previous_command_deadline = _set_command_deadline(deadline)
 
     _shutdown_signal = {"name": None}
 
@@ -158,41 +238,26 @@ def main() -> int:
 
     pr_loop_lock = None
     try:
+        try:
+            pr_data, pr_number = _resolve_pr_data(args)
+        except CommandError as exc:
+            if not args.dry_run and "Could not resolve PR number" not in str(exc):
+                _ensure_runtime_identity()
+            raise
+        branch = _validate_pr_metadata(pr_data, pr_number, args.base)
+        if args.dry_run:
+            _print_step(
+                "Dry run: validated PR #{} {} on branch '{}' targeting base '{}'.".format(
+                    pr_number, pr_data.get("url", ""), branch, args.base
+                )
+            )
+            _print_step(
+                "Dry run: stopped before identity changes, worktree setup, Codex, "
+                "quality gates, rebase, push, reset, approval, merge, or branch deletion."
+            )
+            return 0
         _ensure_runtime_identity()
-        current_branch = _git_branch()
-        pr_ref = str(args.pr) if args.pr is not None else current_branch
-        pr_data = _pr_view(pr_ref)
-        pr_number = pr_data.get("number")
-        if not isinstance(pr_number, int):
-            raise CommandError("Could not resolve PR number for '{}'.".format(pr_ref))
         pr_loop_lock = _acquire_loop_lock(pr_number=pr_number)
-        if pr_data.get("state") != "OPEN":
-            raise CommandError(
-                "PR {} is not open (state={}).".format(
-                    pr_number, pr_data.get("state")
-                )
-            )
-        if pr_data.get("isDraft"):
-            raise CommandError(
-                "PR is in draft state; mark it ready before merge automation."
-            )
-        pr_base = pr_data.get("baseRefName")
-        if pr_base and pr_base != args.base:
-            raise CommandError(
-                "PR #{} targets base '{}' but --base is '{}'. Use the PR base branch.".format(
-                    pr_number, pr_base, args.base
-                )
-            )
-
-        branch = pr_data.get("headRefName")
-        if not branch:
-            raise CommandError("Could not resolve PR head branch.")
-        if branch == args.base:
-            raise CommandError(
-                "PR head branch '{}' matches base '{}'; aborting.".format(
-                    branch, args.base
-                )
-            )
 
         worktree = _ensure_pr_worktree(
             worktree_root=args.worktree_root,
@@ -236,6 +301,7 @@ def main() -> int:
                     review_gate_after_quality_fix=False,
                     max_local_quality_rounds=args.max_local_quality_rounds,
                     pre_round_sha=pre_round_sha,
+                    deadline=deadline,
                 )
                 if commit_state == "discarded":
                     _print_step(
@@ -261,6 +327,7 @@ def main() -> int:
                 review_gate_after_quality_fix=True,
                 max_local_quality_rounds=args.max_local_quality_rounds,
                 pre_round_sha=pre_round_sha,
+                deadline=deadline,
             )
             if commit_state == "discarded":
                 review_passed = False
@@ -326,6 +393,7 @@ def main() -> int:
                 review_gate_after_quality_fix=True,
                 max_local_quality_rounds=args.max_local_quality_rounds,
                 pre_round_sha=pre_round_sha,
+                deadline=deadline,
             )
             if commit_state == "discarded":
                 _print_step(
@@ -341,6 +409,14 @@ def main() -> int:
                     )
                 )
                 continue
+            ci_green, checks = _wait_for_required_checks_green(
+                branch=branch,
+                poll_seconds=args.poll_seconds,
+                timeout_seconds=args.checks_timeout_seconds,
+                deadline=deadline,
+            )
+            if ci_green:
+                break
         if not ci_green:
             if args.max_ci_rounds > 0:
                 raise CommandError(
@@ -366,11 +442,22 @@ def main() -> int:
                 raise CommandError("Required checks failed after rebase.")
 
         if not args.skip_merge:
+            fresh_pr_data = _pr_view(str(pr_number))
+            fresh_branch = _validate_pr_metadata(
+                fresh_pr_data, pr_number, args.base
+            )
+            if fresh_branch != branch:
+                raise CommandError(
+                    "PR #{} head branch changed from '{}' to '{}' during the run.".format(
+                        pr_number, branch, fresh_branch
+                    )
+                )
             _prepare_pr_for_merge(str(pr_number))
             _merge_pr(pr_target)
         _print_step("Done.")
         return 0
     finally:
+        _set_command_deadline(previous_command_deadline)
         if pr_loop_lock is not None:
             pr_loop_lock.release()
         try:

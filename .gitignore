@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ralph-loop/
+.ralph-logs/
+agents-source/
+agents2-research/

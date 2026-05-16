@@ -38,8 +38,11 @@ def _format_failing_checks(records: Sequence[dict]) -> str:
         return "- <none>"
     lines = []
     for rec in records:
+        workflow = " workflow={}".format(rec["workflow"]) if rec.get("workflow") else ""
         link = " {}".format(rec["link"]) if rec.get("link") else ""
-        lines.append("- {} [{}]{}".format(rec["name"], rec["state"], link))
+        lines.append(
+            "- {} [{}]{}{}".format(rec["name"], rec["state"], workflow, link)
+        )
     return "\n".join(lines)
 
 
@@ -53,12 +56,37 @@ def _wait_for_required_checks_green(
 ) -> Tuple[bool, list]:
     _print_step("Waiting for required checks on PR branch {}".format(branch))
     started = time.monotonic()
+
+    def sleep_for_next_poll():
+        elapsed = time.monotonic() - started
+        remaining_timeout = timeout_seconds - elapsed
+        if remaining_timeout <= 0:
+            raise CommandError(
+                "Timed out waiting for required checks after {}s.".format(
+                    timeout_seconds
+                )
+            )
+        delay = min(float(poll_seconds), remaining_timeout)
+        if deadline is not None:
+            remaining_deadline = deadline - time.monotonic()
+            if remaining_deadline <= 0:
+                _check_wall_clock(deadline)
+            delay = min(delay, remaining_deadline)
+        time.sleep(delay)
+
     while True:
         _check_wall_clock(deadline)
         checks, were_required = _required_checks(branch)
         if not checks:
-            _print_step("No checks reported; treating as green.")
-            return True, checks
+            _print_step("No checks reported yet; waiting.")
+            if (time.monotonic() - started) > timeout_seconds:
+                raise CommandError(
+                    "Timed out waiting for checks to appear after {}s.".format(
+                        timeout_seconds
+                    )
+                )
+            sleep_for_next_poll()
+            continue
         if not were_required and not treat_optional_as_blocking:
             _print_step(
                 "No required checks reported; ignoring optional check failures."
@@ -69,6 +97,10 @@ def _wait_for_required_checks_green(
         _print_step("{} check buckets: {}".format(scope, summary))
         buckets = {check.get("bucket") for check in checks}
         if buckets.issubset({"pass", "skipping"}):
+            if not were_required:
+                _print_step("Required checks have not appeared yet; waiting.")
+                sleep_for_next_poll()
+                continue
             return True, checks
         if "pending" not in buckets:
             return False, checks
@@ -78,4 +110,4 @@ def _wait_for_required_checks_green(
                     timeout_seconds
                 )
             )
-        time.sleep(poll_seconds)
+        sleep_for_next_poll()

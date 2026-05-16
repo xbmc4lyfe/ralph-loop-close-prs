@@ -2,13 +2,64 @@
 from __future__ import annotations
 
 import datetime
+import os
 import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Optional, Sequence
 
 from .errors import CommandError
+
+MAX_CAPTURED_STREAM_BYTES = 1 << 20
+_COMMAND_DEADLINE: Optional[float] = None
+_DEFAULT_OUTPUT_LIMIT = object()
+
+
+def _set_command_deadline(deadline: Optional[float]) -> Optional[float]:
+    global _COMMAND_DEADLINE
+    previous = _COMMAND_DEADLINE
+    _COMMAND_DEADLINE = deadline
+    return previous
+
+
+def _remaining_command_timeout(printable_cmd: str) -> Optional[float]:
+    if _COMMAND_DEADLINE is None:
+        return None
+    remaining = _COMMAND_DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise CommandError(
+            "Wall-clock timeout exceeded before command: {}".format(printable_cmd)
+        )
+    return remaining
+
+
+def _read_bounded_output(handle, limit: Optional[int] = MAX_CAPTURED_STREAM_BYTES) -> str:
+    handle.flush()
+    handle.seek(0, os.SEEK_END)
+    size = handle.tell()
+    if limit is None:
+        handle.seek(0)
+        return handle.read().decode("utf-8", errors="replace")
+    if size <= limit:
+        handle.seek(0)
+        return handle.read().decode("utf-8", errors="replace")
+    head_size = max(0, limit // 2)
+    tail_size = max(0, limit - head_size)
+    handle.seek(0)
+    head = handle.read(head_size)
+    tail = b""
+    if tail_size > 0:
+        handle.seek(size - tail_size)
+        tail = handle.read(tail_size)
+    omitted = size - limit
+    return "{}...<truncated {} bytes>...{}".format(
+        head.decode("utf-8", errors="replace"),
+        omitted,
+        tail.decode("utf-8", errors="replace"),
+    )
+
 
 def _print_step(message: str):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -34,30 +85,51 @@ def _run_command(
     check: bool = True,
     capture_output: bool = True,
     cwd: Optional[str] = None,
+    replay_output: bool = True,
+    log_cmd: Optional[Sequence[str]] = None,
+    max_output_bytes=_DEFAULT_OUTPUT_LIMIT,
 ) -> subprocess.CompletedProcess:
-    printable = _printable_cmd(cmd)
+    printable = _printable_cmd(log_cmd or cmd)
     sys.stderr.write("$ {}\n".format(printable))
     sys.stderr.flush()
+    timeout = _remaining_command_timeout(printable)
+    output_limit = (
+        MAX_CAPTURED_STREAM_BYTES
+        if max_output_bytes is _DEFAULT_OUTPUT_LIMIT
+        else max_output_bytes
+    )
     if capture_output:
-        stdout_spool = tempfile.SpooledTemporaryFile(
-            max_size=1 << 20, mode="w+", encoding="utf-8"
-        )
-        stderr_spool = tempfile.SpooledTemporaryFile(
-            max_size=1 << 20, mode="w+", encoding="utf-8"
-        )
+        stdout_spool = tempfile.TemporaryFile(mode="w+b")
+        stderr_spool = tempfile.TemporaryFile(mode="w+b")
         try:
-            completed = subprocess.run(  # nosec B603
-                list(cmd),
-                cwd=cwd,
-                text=True,
-                stdout=stdout_spool,
-                stderr=stderr_spool,
-                check=False,
-            )
-            stdout_spool.seek(0)
-            stderr_spool.seek(0)
-            stdout_data = stdout_spool.read()
-            stderr_data = stderr_spool.read()
+            try:
+                completed = subprocess.run(  # nosec B603
+                    list(cmd),
+                    cwd=cwd,
+                    stdout=stdout_spool,
+                    stderr=stderr_spool,
+                    stdin=subprocess.DEVNULL,
+                    check=False,
+                    timeout=timeout,
+                )
+            except OSError as exc:
+                raise CommandError(
+                    "Unable to run command: {}: {}".format(printable, exc)
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                stdout_data = _read_bounded_output(stdout_spool, output_limit)
+                stderr_data = _read_bounded_output(stderr_spool, output_limit)
+                if replay_output and stdout_data:
+                    sys.stdout.write(stdout_data)
+                if replay_output and stderr_data:
+                    sys.stderr.write(stderr_data)
+                raise CommandError(
+                    "Command timed out after {:.2f}s: {}".format(
+                        float(exc.timeout), printable
+                    )
+                ) from exc
+            stdout_data = _read_bounded_output(stdout_spool, output_limit)
+            stderr_data = _read_bounded_output(stderr_spool, output_limit)
         finally:
             stdout_spool.close()
             stderr_spool.close()
@@ -68,13 +140,26 @@ def _run_command(
             stderr=stderr_data,
         )
     else:
-        completed = subprocess.run(  # nosec B603
-            list(cmd),
-            cwd=cwd,
-            text=True,
-            check=False,
-        )
-    if capture_output:
+        try:
+            completed = subprocess.run(  # nosec B603
+                list(cmd),
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+        except OSError as exc:
+            raise CommandError(
+                "Unable to run command: {}: {}".format(printable, exc)
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise CommandError(
+                "Command timed out after {:.2f}s: {}".format(
+                    float(exc.timeout), printable
+                )
+            ) from exc
+    if capture_output and replay_output:
         if completed.stdout:
             sys.stdout.write(completed.stdout)
         if completed.stderr:
