@@ -531,15 +531,17 @@ def test_fan_out_supervisor_respawns_exited_children_until_shutdown(
     clock = {"t": 0.0}
     monkeypatch.setattr(cli.time, "monotonic", lambda: clock["t"])
 
-    sleep_calls = {"n": 0}
+    wait_calls = {"n": 0}
 
-    def fake_sleep(_seconds):
+    def fake_wait(event, _timeout):
         clock["t"] += 60.0
-        sleep_calls["n"] += 1
-        if sleep_calls["n"] >= 3:
-            os.kill(os.getpid(), signal.SIGTERM)
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 3:
+            event.set()
+            return True
+        return False
 
-    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
 
     script_path = tmp_path / "script.py"
     script_path.write_text("# stub\n")
@@ -574,14 +576,16 @@ def test_fan_out_supervisor_kills_idle_child_using_log_mtime_watchdog(
 
     monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(cli.os.path, "getmtime", lambda _path: 0.0)
-    sleep_calls = {"n": 0}
+    wait_calls = {"n": 0}
 
-    def fake_sleep(_seconds):
-        sleep_calls["n"] += 1
-        if sleep_calls["n"] >= 2:
-            os.kill(os.getpid(), signal.SIGTERM)
+    def fake_wait(event, _timeout):
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 2:
+            event.set()
+            return True
+        return False
 
-    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
 
     script_path = tmp_path / "script.py"
     script_path.write_text("# stub\n")

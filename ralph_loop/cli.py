@@ -7,6 +7,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -286,6 +287,10 @@ def _passthrough_args(argv: List[str]) -> List[str]:
     return out
 
 
+def _supervisor_wait(event: "threading.Event", timeout: float) -> bool:
+    return event.wait(timeout=timeout)
+
+
 def _spawn_child(
     *,
     pr: int,
@@ -342,9 +347,11 @@ def _fan_out_all_prs(
     children: Dict[int, Tuple[subprocess.Popen, str, Any, float]] = {}
     last_exit_at: Dict[int, float] = {}
     shutting_down = {"flag": False}
+    shutdown_event = threading.Event()
 
     def _request_shutdown(signum, _frame):
         shutting_down["flag"] = True
+        shutdown_event.set()
         sys.stderr.write(
             "\nSupervisor received {}; terminating children...\n".format(
                 signal.Signals(signum).name
@@ -367,7 +374,8 @@ def _fan_out_all_prs(
                 "Launched PR #{} pid={} (log: {})".format(pr, proc.pid, log_path)
             )
         while not shutting_down["flag"] and (children or last_exit_at):
-            time.sleep(min(10, stuck_timeout))
+            if _supervisor_wait(shutdown_event, min(10.0, float(stuck_timeout))):
+                break
             now = time.monotonic()
             for pr in list(children.keys()):
                 proc, log_path, log_handle, _spawned_at = children[pr]
