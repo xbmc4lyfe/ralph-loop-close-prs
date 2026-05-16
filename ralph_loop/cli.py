@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -200,17 +201,30 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help=(
+            "Treat each positional directory as a parent and discover git "
+            "repositories in its immediate subdirectories. Each discovered "
+            "repo gets its own supervisor in parallel."
+        ),
+    )
+    parser.add_argument(
         "directory",
-        nargs="?",
+        nargs="*",
         default=None,
         help=(
-            "Target repository directory to run against. Defaults to the "
-            "current working directory."
+            "One or more target repository directories. With multiple, each "
+            "gets its own supervisor in parallel. With --recursive, each "
+            "directory is scanned for git repos in its immediate subdirs. "
+            "Defaults to the current working directory."
         ),
     )
     args = parser.parse_args()
     if args.all_prs and args.pr is not None:
         parser.error("--all-prs cannot be combined with --pr")
+    if args.pr is not None and args.directory and len(args.directory) > 1:
+        parser.error("--pr cannot be combined with multiple directories")
     return args
 
 
@@ -656,16 +670,185 @@ def _fan_out_all_prs(
     return 0
 
 
+def _resolve_target_directories(
+    raw_dirs: List[str], recursive: bool
+) -> List[str]:
+    """Expand the user-supplied directory args into concrete repo paths.
+
+    - If ``recursive`` is set, each input path is treated as a parent and we
+      scan its immediate subdirectories for git repos (presence of ``.git``).
+    - Each result is realpath'd and deduplicated while preserving order.
+    - Raises CommandError if any input is not a directory.
+    """
+    resolved: List[str] = []
+    seen: set = set()
+
+    def _push(path: str) -> None:
+        real = os.path.realpath(path)
+        if real in seen:
+            return
+        seen.add(real)
+        resolved.append(real)
+
+    for raw in raw_dirs:
+        path = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isdir(path):
+            raise CommandError(
+                "Target directory does not exist or is not a directory: {}".format(
+                    raw
+                )
+            )
+        if not recursive:
+            _push(path)
+            continue
+        for name in sorted(os.listdir(path)):
+            child = os.path.join(path, name)
+            if not os.path.isdir(child):
+                continue
+            if os.path.isdir(os.path.join(child, ".git")) or os.path.isfile(
+                os.path.join(child, ".git")
+            ):
+                _push(child)
+    if recursive and not resolved:
+        raise CommandError(
+            "No git repositories found under any of the recursive parents."
+        )
+    return resolved
+
+
+def _fan_out_across_directories(
+    args: argparse.Namespace,
+    argv: List[str],
+    script_path: str,
+    target_dirs: List[str],
+    original_cwd: str,
+) -> int:
+    """Spawn one ralph supervisor per target directory in parallel."""
+    if args.fan_out_log_dir:
+        log_root = os.path.abspath(os.path.expanduser(args.fan_out_log_dir))
+    else:
+        log_root = os.path.join(
+            os.path.dirname(script_path), ".ralph-logs", "multi-repo"
+        )
+    os.makedirs(log_root, exist_ok=True)
+    _print_step(
+        "Multi-directory fan-out: launching {} supervisor(s); logs in {}".format(
+            len(target_dirs), log_root
+        )
+    )
+    base_args: List[str] = []
+    skip_next = False
+    for token in argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--recursive":
+            continue
+        if token in target_dirs:
+            continue
+        base_args.append(token)
+    procs: List[Tuple[str, subprocess.Popen, str, Any]] = []
+    for target_dir in target_dirs:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", os.path.basename(target_dir.rstrip("/"))) or "repo"
+        log_path = os.path.join(log_root, "{}.log".format(slug))
+        log_handle = open(log_path, "ab", buffering=0)
+        cmd = [sys.executable, script_path] + base_args + [target_dir]
+        log_handle.write(
+            "\n=== spawn {} ===\n$ {}\n".format(
+                time.strftime("%Y-%m-%d %H:%M:%S"), shlex.join(cmd)
+            ).encode("utf-8", errors="replace")
+        )
+        _print_step(
+            "Launched repo supervisor for {} (log: {})".format(target_dir, log_path)
+        )
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        procs.append((target_dir, proc, log_path, log_handle))
+    shutdown_event = threading.Event()
+
+    def _request_shutdown(_signum, _frame):
+        shutdown_event.set()
+
+    prev_int = signal.signal(signal.SIGINT, _request_shutdown)
+    prev_term = signal.signal(signal.SIGTERM, _request_shutdown)
+    try:
+        while procs:
+            if shutdown_event.wait(timeout=5):
+                break
+            still_running = []
+            for target_dir, proc, log_path, log_handle in procs:
+                rc = proc.poll()
+                if rc is None:
+                    still_running.append((target_dir, proc, log_path, log_handle))
+                    continue
+                try:
+                    log_handle.close()
+                except OSError:
+                    pass
+                _print_step(
+                    "Repo supervisor for {} exited with code {} (log: {})".format(
+                        target_dir, rc, log_path
+                    )
+                )
+            procs = still_running
+    finally:
+        for target_dir, proc, _log_path, log_handle in procs:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        for target_dir, proc, _log_path, log_handle in procs:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            try:
+                log_handle.close()
+            except OSError:
+                pass
+        signal.signal(signal.SIGINT, prev_int)
+        signal.signal(signal.SIGTERM, prev_term)
+        try:
+            os.chdir(original_cwd)
+        except OSError:
+            pass
+    _print_step("Multi-directory fan-out exited.")
+    return 0
+
+
 def main() -> int:
     original_cwd = os.getcwd()
     script_path = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
     args = _parse_args()
-    if args.directory is not None:
-        target_dir = os.path.abspath(os.path.expanduser(args.directory))
+    raw_dirs = args.directory or []
+    target_dirs = (
+        _resolve_target_directories(raw_dirs, args.recursive)
+        if (raw_dirs or args.recursive)
+        else []
+    )
+    if len(target_dirs) > 1:
+        if not script_path or not os.path.isfile(script_path):
+            raise CommandError(
+                "Cannot resolve ralph script path for multi-directory fan-out: {!r}".format(
+                    sys.argv[0] if sys.argv else ""
+                )
+            )
+        return _fan_out_across_directories(
+            args, sys.argv, script_path, target_dirs, original_cwd
+        )
+    if target_dirs:
+        target_dir = target_dirs[0]
         if not os.path.isdir(target_dir):
             raise CommandError(
                 "Target directory does not exist or is not a directory: {}".format(
-                    args.directory
+                    target_dir
                 )
             )
         os.chdir(target_dir)

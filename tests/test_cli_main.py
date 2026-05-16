@@ -355,14 +355,16 @@ def test_parse_args_accepts_directory_positional_and_all_prs_flag(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["ralph", "--all-prs", "/tmp/some-dir"])
     args = cli._parse_args()
     assert args.all_prs is True
-    assert args.directory == "/tmp/some-dir"
+    assert args.directory == ["/tmp/some-dir"]
+    assert args.recursive is False
     assert args.pr is None
 
 
 def test_parse_args_defaults_directory_and_all_prs_off(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["ralph"])
     args = cli._parse_args()
-    assert args.directory is None
+    assert args.directory == []
+    assert args.recursive is False
     assert args.all_prs is False
 
 
@@ -377,7 +379,23 @@ def test_parse_args_accepts_directory_after_pr_flag(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["ralph", "--pr", "12", "/tmp/some-dir"])
     args = cli._parse_args()
     assert args.pr == 12
-    assert args.directory == "/tmp/some-dir"
+    assert args.directory == ["/tmp/some-dir"]
+
+
+def test_parse_args_accepts_multiple_directories_and_recursive(monkeypatch):
+    monkeypatch.setattr(
+        sys, "argv", ["ralph", "--recursive", "/tmp/a", "/tmp/b", "/tmp/c"]
+    )
+    args = cli._parse_args()
+    assert args.recursive is True
+    assert args.directory == ["/tmp/a", "/tmp/b", "/tmp/c"]
+
+
+def test_parse_args_rejects_pr_with_multiple_directories(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["ralph", "--pr", "5", "/tmp/a", "/tmp/b"])
+    with pytest.raises(SystemExit):
+        cli._parse_args()
+    assert "--pr cannot be combined with multiple directories" in capsys.readouterr().err
 
 
 def test_main_chdirs_into_directory_argument_before_resolving_pr(
@@ -386,7 +404,7 @@ def test_main_chdirs_into_directory_argument_before_resolving_pr(
     target_dir = tmp_path / "target-repo"
     target_dir.mkdir()
     original_cwd = os.getcwd()
-    harness = cli_harness(args=cli_args(directory=str(target_dir)))
+    harness = cli_harness(args=cli_args(directory=[str(target_dir)]))
     seen_cwds = []
     real_pr_view = harness.pr_view
 
@@ -403,7 +421,7 @@ def test_main_chdirs_into_directory_argument_before_resolving_pr(
 
 def test_main_rejects_nonexistent_directory_argument(cli_harness, cli_args, tmp_path):
     missing = tmp_path / "does-not-exist"
-    cli_harness(args=cli_args(directory=str(missing)))
+    cli_harness(args=cli_args(directory=[str(missing)]))
 
     with pytest.raises(CommandError, match="Target directory does not exist"):
         cli.main()
@@ -623,7 +641,7 @@ def test_main_with_all_prs_triggers_fan_out_and_skips_single_pr_path(
     monkeypatch.setattr(
         sys, "argv", [str(script_path), "--all-prs", str(target)]
     )
-    harness = cli_harness(args=cli_args(all_prs=True, directory=str(target)))
+    harness = cli_harness(args=cli_args(all_prs=True, directory=[str(target)]))
     called = {"count": 0}
 
     def fake_fan_out(args, argv, sp):
@@ -647,7 +665,7 @@ def test_main_implicit_fan_out_when_on_base_branch_without_pr(
     script_path.write_text("# stub\n")
     monkeypatch.setattr(sys, "argv", [str(script_path), str(target)])
     harness = cli_harness(
-        args=cli_args(pr=None, all_prs=False, directory=str(target))
+        args=cli_args(pr=None, all_prs=False, directory=[str(target)])
     )
     harness.git_branch.return_value = "main"
     called = {"count": 0}

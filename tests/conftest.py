@@ -42,6 +42,7 @@ def make_args(**overrides):
         "worktree_root": "/tmp/ralph-worktrees",
         "max_wall_clock_seconds": 0,
         "directory": None,
+        "recursive": False,
         "all_prs": False,
         "fan_out_log_dir": None,
         "fan_out_stuck_timeout_seconds": 900,
