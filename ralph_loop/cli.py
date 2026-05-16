@@ -338,6 +338,20 @@ def _post_addressed_comment_replies(
             )
 
 
+def _open_log_handle_cloexec(log_path: str) -> Any:
+    """Open ``log_path`` for append in binary mode with FD_CLOEXEC set.
+
+    Using ``O_CLOEXEC`` ensures the parent-side log file descriptor is closed
+    automatically if the supervisor re-execs (e.g. SIGHUP reload) so we do not
+    leak fds across reload cycles. ``subprocess.Popen`` still dup2's the fd
+    into the child's stdout, and dup2 clears the close-on-exec flag for the
+    duplicated descriptor, so child log redirection continues to work.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC
+    fd = os.open(log_path, flags, 0o644)
+    return os.fdopen(fd, "ab", buffering=0)
+
+
 def _spawn_child(
     *,
     pr: int,
@@ -347,7 +361,7 @@ def _spawn_child(
 ) -> Tuple[subprocess.Popen, str, Any]:
     cmd = [sys.executable, script_path] + base_child_args + ["--pr", str(pr)]
     log_path = os.path.join(log_root, "pr-{}.log".format(pr))
-    log_handle = open(log_path, "ab", buffering=0)
+    log_handle = _open_log_handle_cloexec(log_path)
     log_handle.write(
         "\n=== spawn {} ===\n$ {}\n".format(
             time.strftime("%Y-%m-%d %H:%M:%S"), shlex.join(cmd)
@@ -443,6 +457,7 @@ def _fan_out_all_prs(
     last_exit_at: Dict[int, float] = {}
     pending_backoff: Dict[int, float] = {}
     shutting_down = {"flag": False}
+    reload_requested = {"flag": False}
     shutdown_event = threading.Event()
 
     def _request_shutdown(signum, _frame):
@@ -455,8 +470,16 @@ def _fan_out_all_prs(
         )
         sys.stderr.flush()
 
+    def _request_reload(_signum, _frame):
+        reload_requested["flag"] = True
+        shutting_down["flag"] = True
+        shutdown_event.set()
+
     previous_int = signal.signal(signal.SIGINT, _request_shutdown)
     previous_term = signal.signal(signal.SIGTERM, _request_shutdown)
+    previous_hup = None
+    if hasattr(signal, "SIGHUP"):
+        previous_hup = signal.signal(signal.SIGHUP, _request_reload)
     try:
         for pr in pr_numbers:
             proc, log_path, log_handle = _spawn_child(
@@ -580,6 +603,30 @@ def _fan_out_all_prs(
                     )
                 )
     finally:
+        if reload_requested["flag"]:
+            _print_step(
+                "Reload requested via SIGHUP; re-exec'ing supervisor"
+            )
+            for pr, (proc, _log_path, log_handle, _spawned_at) in list(
+                children.items()
+            ):
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    log_handle.close()
+                except OSError:
+                    pass
+            signal.signal(signal.SIGINT, previous_int)
+            signal.signal(signal.SIGTERM, previous_term)
+            if previous_hup is not None and hasattr(signal, "SIGHUP"):
+                signal.signal(signal.SIGHUP, previous_hup)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.execv(
+                sys.executable, [sys.executable, script_path] + sys.argv[1:]
+            )
         for pr, (proc, _log_path, log_handle, _spawned_at) in list(children.items()):
             try:
                 proc.terminate()
@@ -603,6 +650,8 @@ def _fan_out_all_prs(
                 pass
         signal.signal(signal.SIGINT, previous_int)
         signal.signal(signal.SIGTERM, previous_term)
+        if previous_hup is not None and hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, previous_hup)
     _print_step("Fan-out supervisor exited cleanly.")
     return 0
 

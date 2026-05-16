@@ -1135,3 +1135,236 @@ def test_fan_out_supervisor_respawns_normally_after_short_backoff_for_nonzero_ex
 
     assert rc == 0
     assert len(procs_made) >= 2, "ordinary exit should respawn within short backoff"
+
+
+def test_spawn_child_opens_log_handle_with_o_cloexec(monkeypatch, tmp_path):
+    """Parent-side log fds must have FD_CLOEXEC so they don't leak across exec."""
+    captured = {}
+
+    real_os_open = os.open
+
+    def recording_open(path, flags, mode=0o644):
+        captured["path"] = path
+        captured["flags"] = flags
+        captured["mode"] = mode
+        return real_os_open(path, flags, mode)
+
+    monkeypatch.setattr(cli.os, "open", recording_open)
+    monkeypatch.setattr(
+        cli.subprocess, "Popen", lambda *a, **k: _FakeProc(pid=1, exit_after_polls=1)
+    )
+
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+
+    _, _, log_handle = cli._spawn_child(
+        pr=99,
+        script_path="/abs/script.py",
+        base_child_args=[],
+        log_root=str(log_root),
+    )
+
+    try:
+        assert captured["flags"] & os.O_CLOEXEC, (
+            "log handle must be opened with O_CLOEXEC to avoid leaking fds "
+            "on supervisor re-exec; got flags={:#x}".format(captured["flags"])
+        )
+        assert captured["flags"] & os.O_APPEND
+        assert captured["path"] == str(log_root / "pr-99.log")
+    finally:
+        log_handle.close()
+
+
+def test_open_log_handle_cloexec_sets_close_on_exec_on_real_fd(tmp_path):
+    """The returned handle's underlying fd must actually have FD_CLOEXEC set."""
+    import fcntl
+
+    log_path = tmp_path / "pr-1.log"
+    handle = cli._open_log_handle_cloexec(str(log_path))
+    try:
+        flags = fcntl.fcntl(handle.fileno(), fcntl.F_GETFD)
+        assert flags & fcntl.FD_CLOEXEC, (
+            "expected FD_CLOEXEC bit on real log handle fd, got {:#x}".format(flags)
+        )
+    finally:
+        handle.close()
+
+
+def test_fan_out_installs_sighup_reload_handler(monkeypatch, cli_args, tmp_path):
+    """SIGHUP handler must be installed alongside SIGINT/SIGTERM."""
+    if not hasattr(signal, "SIGHUP"):
+        pytest.skip("SIGHUP not available on this platform")
+
+    install_log = []
+
+    def capture_signal(signum, handler):
+        install_log.append((signum, handler))
+        return signal.SIG_DFL
+
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [42])
+    monkeypatch.setattr(
+        cli.subprocess, "Popen", lambda *a, **k: _FakeProc(pid=1, exit_after_polls=1)
+    )
+    monkeypatch.setattr(cli.signal, "signal", capture_signal)
+
+    def fake_wait(event, _timeout):
+        event.set()
+        return True
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_respawn_backoff_seconds=1,
+            fan_out_stuck_timeout_seconds=60,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    callable_installs = {
+        signum for signum, handler in install_log if callable(handler)
+    }
+    assert signal.SIGINT in callable_installs
+    assert signal.SIGTERM in callable_installs
+    assert signal.SIGHUP in callable_installs
+
+
+def test_fan_out_sighup_triggers_execv_with_supervisor_argv(
+    monkeypatch, cli_args, tmp_path
+):
+    """SIGHUP should re-exec the supervisor via os.execv with current sys.argv."""
+    if not hasattr(signal, "SIGHUP"):
+        pytest.skip("SIGHUP not available on this platform")
+
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [55])
+
+    procs_made = []
+
+    def fake_popen(_cmd, **_kwargs):
+        proc = _FakeProc(pid=500 + len(procs_made), exit_after_polls=99)
+        procs_made.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    # Capture installed signal handlers so we can fire SIGHUP synthetically.
+    handlers = {}
+    real_signal_signal = signal.signal
+
+    def capture_signal(signum, handler):
+        handlers[signum] = handler
+        return real_signal_signal(signum, signal.SIG_IGN)
+
+    monkeypatch.setattr(cli.signal, "signal", capture_signal)
+
+    # Fire SIGHUP on the first supervisor_wait call.
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        wait_calls["n"] += 1
+        if wait_calls["n"] == 1:
+            # Invoke the SIGHUP handler synchronously.
+            assert signal.SIGHUP in handlers, "SIGHUP handler not installed"
+            handlers[signal.SIGHUP](signal.SIGHUP, None)
+        return event.wait(0.0) or wait_calls["n"] >= 5
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    exec_calls = []
+
+    def fake_execv(path, argv):
+        exec_calls.append((path, list(argv)))
+        # os.execv normally never returns; raise to short-circuit.
+        raise SystemExit("execv-called")
+
+    monkeypatch.setattr(cli.os, "execv", fake_execv)
+
+    script_path = tmp_path / "ralph_script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    monkeypatch.setattr(
+        sys, "argv", [str(script_path), "--all-prs", "--base", "main"]
+    )
+
+    with pytest.raises(SystemExit, match="execv-called"):
+        cli._fan_out_all_prs(
+            cli_args(
+                all_prs=True,
+                fan_out_log_dir=str(log_dir),
+                fan_out_respawn_backoff_seconds=1,
+                fan_out_stuck_timeout_seconds=60,
+            ),
+            ["script.py", "--all-prs"],
+            str(script_path),
+        )
+
+    assert len(exec_calls) == 1
+    exec_path, exec_argv = exec_calls[0]
+    assert exec_path == sys.executable
+    assert exec_argv[0] == sys.executable
+    assert exec_argv[1] == str(script_path)
+    # The remaining argv should be sys.argv[1:] verbatim (the args the user
+    # originally passed to the supervisor).
+    assert exec_argv[2:] == ["--all-prs", "--base", "main"]
+    # Children should have been terminated (but not necessarily waited for).
+    assert any(p.terminated for p in procs_made)
+
+
+def test_fan_out_no_execv_when_normal_shutdown(monkeypatch, cli_args, tmp_path):
+    """SIGINT/SIGTERM path must not call os.execv."""
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [77])
+
+    def fake_popen(_cmd, **_kwargs):
+        return _FakeProc(pid=600, exit_after_polls=99)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    handlers = {}
+    real_signal_signal = signal.signal
+
+    def capture_signal(signum, handler):
+        handlers[signum] = handler
+        return real_signal_signal(signum, signal.SIG_IGN)
+
+    monkeypatch.setattr(cli.signal, "signal", capture_signal)
+
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        wait_calls["n"] += 1
+        if wait_calls["n"] == 1:
+            handlers[signal.SIGINT](signal.SIGINT, None)
+        return event.wait(0.0) or wait_calls["n"] >= 5
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    exec_calls = []
+    monkeypatch.setattr(
+        cli.os, "execv", lambda *a, **k: exec_calls.append(a)
+    )
+
+    script_path = tmp_path / "ralph_script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_respawn_backoff_seconds=1,
+            fan_out_stuck_timeout_seconds=60,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    assert exec_calls == [], "SIGINT must not trigger os.execv"
