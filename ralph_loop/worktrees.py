@@ -142,10 +142,10 @@ def _worktree_path_is_registered(path: str) -> bool:
         check=True,
         capture_output=True,
     )
-    expected = os.path.abspath(path)
+    expected = os.path.realpath(path)
     for line in (completed.stdout or "").splitlines():
         if line.startswith("worktree "):
-            if os.path.abspath(line[len("worktree ") :]) == expected:
+            if os.path.realpath(line[len("worktree ") :]) == expected:
                 return True
     return False
 
@@ -227,9 +227,9 @@ def _ensure_pr_worktree(
     start_ref = _fetch_pr_branch_or_head(pr_number=pr_number, branch=branch)
     existing_branch_worktree = _worktree_for_branch(branch)
     if existing_branch_worktree:
-        existing_abs = os.path.abspath(existing_branch_worktree)
-        cwd_abs = os.path.abspath(os.getcwd())
-        desired_abs = os.path.abspath(path)
+        existing_abs = os.path.realpath(existing_branch_worktree)
+        cwd_abs = os.path.realpath(os.getcwd())
+        desired_abs = os.path.realpath(path)
         if existing_abs == cwd_abs and existing_abs != desired_abs:
             _print_step(
                 "PR branch '{}' is already checked out at the target directory {}; "
