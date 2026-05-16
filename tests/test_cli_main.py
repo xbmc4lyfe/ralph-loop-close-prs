@@ -598,7 +598,7 @@ def test_fan_out_supervisor_respawns_exited_children_until_shutdown(
     monkeypatch, cli_args, tmp_path
 ):
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [50])
-    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
+    monkeypatch.setattr(cli, "_prs_are_still_open", lambda _prs: {pr: True for pr in _prs})
     procs_made = []
 
     def fake_popen(_cmd, **_kwargs):
@@ -647,7 +647,7 @@ def test_fan_out_supervisor_kills_idle_child_using_log_mtime_watchdog(
     monkeypatch, cli_args, tmp_path
 ):
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [33])
-    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
+    monkeypatch.setattr(cli, "_prs_are_still_open", lambda _prs: {pr: True for pr in _prs})
     procs_made = []
 
     def fake_popen(_cmd, **_kwargs):
@@ -769,7 +769,17 @@ def test_fan_out_skips_initial_spawn_for_prs_that_are_no_longer_open(
         # 101 was merged between list and view.
         return pr != 101
 
-    monkeypatch.setattr(cli, "_pr_is_still_open", fake_state)
+
+    def mock_fake_state_batch(prs):
+        res = {}
+        for pr in prs:
+            try:
+                res[pr] = fake_state(pr)
+            except Exception as e:
+                res[pr] = e
+        return res
+    monkeypatch.setattr(cli, "_prs_are_still_open", mock_fake_state_batch)
+
     spawned: List[int] = []
 
     def fake_popen(cmd, **_kwargs):
@@ -820,7 +830,17 @@ def test_fan_out_keeps_pr_in_initial_set_when_open_check_raises(
     def boom(_pr):
         raise CommandError("i/o timeout")
 
-    monkeypatch.setattr(cli, "_pr_is_still_open", boom)
+
+    def mock_boom_batch(prs):
+        res = {}
+        for pr in prs:
+            try:
+                res[pr] = boom(pr)
+            except Exception as e:
+                res[pr] = e
+        return res
+    monkeypatch.setattr(cli, "_prs_are_still_open", mock_boom_batch)
+
     spawned: List[int] = []
 
     def fake_popen(cmd, **_kwargs):
@@ -867,7 +887,7 @@ def test_fan_out_returns_zero_when_all_initial_prs_are_filtered_out(
 ):
     """If every initial-list PR turns out to be merged, exit cleanly."""
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [101, 102])
-    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: False)
+    monkeypatch.setattr(cli, "_prs_are_still_open", lambda prs: {pr: False for pr in prs})
     monkeypatch.setattr(
         cli.subprocess,
         "Popen",
@@ -902,7 +922,17 @@ def test_fan_out_respawn_block_uses_pr_is_still_open_to_drop_merged_prs(
         # First call (initial filter) -> True; subsequent (respawn check) -> False.
         return len(open_state_calls) == 1
 
-    monkeypatch.setattr(cli, "_pr_is_still_open", fake_state)
+
+    def mock_fake_state_batch(prs):
+        res = {}
+        for pr in prs:
+            try:
+                res[pr] = fake_state(pr)
+            except Exception as e:
+                res[pr] = e
+        return res
+    monkeypatch.setattr(cli, "_prs_are_still_open", mock_fake_state_batch)
+
 
     list_open_calls = {"n": 0}
 
@@ -975,7 +1005,17 @@ def test_fan_out_respawn_block_keeps_pr_when_state_check_raises(
             return True
         raise CommandError("i/o timeout")
 
-    monkeypatch.setattr(cli, "_pr_is_still_open", fake_state)
+
+    def mock_fake_state_batch(prs):
+        res = {}
+        for pr in prs:
+            try:
+                res[pr] = fake_state(pr)
+            except Exception as e:
+                res[pr] = e
+        return res
+    monkeypatch.setattr(cli, "_prs_are_still_open", mock_fake_state_batch)
+
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [50])
 
     procs_made = []
@@ -1097,7 +1137,7 @@ def test_fan_out_supervisor_uses_long_backoff_after_env_failure_exit(
     monkeypatch, cli_args, tmp_path
 ):
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [99])
-    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
+    monkeypatch.setattr(cli, "_prs_are_still_open", lambda _prs: {pr: True for pr in _prs})
     procs_made = []
 
     def fake_popen(_cmd, **_kwargs):
@@ -1164,7 +1204,7 @@ def test_fan_out_supervisor_respawns_normally_after_short_backoff_for_nonzero_ex
     # guards against the long-backoff change accidentally applying to ordinary
     # failures.
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [88])
-    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
+    monkeypatch.setattr(cli, "_prs_are_still_open", lambda _prs: {pr: True for pr in _prs})
     procs_made = []
 
     def fake_popen(_cmd, **_kwargs):
@@ -1279,7 +1319,7 @@ def test_fan_out_installs_sighup_reload_handler(monkeypatch, cli_args, tmp_path)
         return signal.SIG_DFL
 
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [42])
-    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
+    monkeypatch.setattr(cli, "_prs_are_still_open", lambda _prs: {pr: True for pr in _prs})
     monkeypatch.setattr(
         cli.subprocess, "Popen", lambda *a, **k: _FakeProc(pid=1, exit_after_polls=1)
     )
@@ -1322,7 +1362,7 @@ def test_fan_out_sighup_triggers_execv_with_supervisor_argv(
         pytest.skip("SIGHUP not available on this platform")
 
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [55])
-    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
+    monkeypatch.setattr(cli, "_prs_are_still_open", lambda _prs: {pr: True for pr in _prs})
 
     procs_made = []
 
@@ -1400,7 +1440,7 @@ def test_fan_out_sighup_triggers_execv_with_supervisor_argv(
 def test_fan_out_no_execv_when_normal_shutdown(monkeypatch, cli_args, tmp_path):
     """SIGINT/SIGTERM path must not call os.execv."""
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [77])
-    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
+    monkeypatch.setattr(cli, "_prs_are_still_open", lambda _prs: {pr: True for pr in _prs})
 
     def fake_popen(_cmd, **_kwargs):
         return _FakeProc(pid=600, exit_after_polls=99)
