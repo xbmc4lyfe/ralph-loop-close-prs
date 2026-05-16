@@ -2,35 +2,55 @@
 """Codex-driven review/fix loop with CI monitoring and merge automation."""
 from __future__ import annotations
 
+import sys
+
+if sys.version_info < (3, 8):
+    sys.stderr.write(
+        "ERROR: Python 3.8+ is required (uses shlex.join); got {}.{}.\n".format(
+            sys.version_info.major, sys.version_info.minor
+        )
+    )
+    raise SystemExit(2)
+
 import argparse
+import datetime
 import fcntl
 import json
 import os
 import re
 import shlex
 import subprocess
-import sys
 import tempfile
 import textwrap
 import time
 from typing import List, Optional, Sequence, Tuple
 
-COAUTHOR_LINE = "Co-Authored-By: Oz <oz-agent@warp.dev>"
-EXPECTED_GH_USER = "xbmc4lyfe"
-EXPECTED_GIT_USER = "xbmc4lyfe"
-EXPECTED_GIT_EMAIL = "xbmc4lyfe@users.noreply.github.com"
-NEEDS_REVIEW_LABEL = "needs review"
-REQUIRED_GH_USER = "xbmc4lyfe"
-REQUIRED_GIT_NAME = "xbmc4lyfe"
-REQUIRED_GIT_EMAIL = "xbmc4lyfe@users.noreply.github.com"
-REQUIRED_AUTH_KEY = "/Users/allen/.ssh/id_ed25519_xbmc4lyfe"
-REQUIRED_SIGNING_KEY = "/Users/allen/.ssh/id_ed25519_signing.pub"
-REQUIRED_SSH_COMMAND = (
-    "ssh -i /Users/allen/.ssh/id_ed25519_xbmc4lyfe "
-    "-o IdentitiesOnly=yes -o IdentityAgent=none"
+GH_USER = os.environ.get("RALPH_GH_USER", "xbmc4lyfe")
+GIT_NAME = os.environ.get("RALPH_GIT_NAME", GH_USER)
+GIT_EMAIL = os.environ.get(
+    "RALPH_GIT_EMAIL", "{}@users.noreply.github.com".format(GH_USER)
 )
+SSH_AUTH_KEY = os.environ.get(
+    "RALPH_SSH_AUTH_KEY",
+    os.path.expanduser("~/.ssh/id_ed25519_{}".format(GH_USER)),
+)
+SSH_SIGNING_KEY = os.environ.get(
+    "RALPH_SSH_SIGNING_KEY",
+    os.path.expanduser("~/.ssh/id_ed25519_signing.pub"),
+)
+SSH_COMMAND = os.environ.get(
+    "RALPH_SSH_COMMAND",
+    "ssh -i {} -o IdentitiesOnly=yes -o IdentityAgent=none".format(SSH_AUTH_KEY),
+)
+COAUTHOR_LINE = os.environ.get(
+    "RALPH_COAUTHOR_LINE", "Co-Authored-By: Oz <oz-agent@warp.dev>"
+)
+NEEDS_REVIEW_LABEL = "needs review"
 LOOP_ALREADY_RUNNING_MESSAGE = "found another ralph loop already for this PR"
-DEFAULT_WORKTREE_ROOT = "/private/tmp/codex-ralph-worktrees"
+DEFAULT_WORKTREE_ROOT = os.environ.get(
+    "RALPH_WORKTREE_ROOT",
+    os.path.join(tempfile.gettempdir(), "codex-ralph-worktrees"),
+)
 QUALITY_GATE_OUTPUT_LIMIT = 12000
 
 
@@ -39,8 +59,21 @@ class CommandError(RuntimeError):
 
 
 def _print_step(message: str):
-    sys.stdout.write("\n==> {}\n".format(message))
-    sys.stdout.flush()
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    sys.stderr.write("\n[{}] ==> {}\n".format(timestamp, message))
+    sys.stderr.flush()
+
+
+def _printable_cmd(cmd: Sequence[str], *, max_arg_len: int = 4000) -> str:
+    parts = []
+    for arg in cmd:
+        if len(arg) > max_arg_len:
+            parts.append(
+                "{}...<+{} chars>".format(arg[:max_arg_len], len(arg) - max_arg_len)
+            )
+        else:
+            parts.append(arg)
+    return shlex.join(parts)
 
 
 def _run_command(
@@ -50,9 +83,9 @@ def _run_command(
     capture_output: bool = True,
     cwd: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
-    printable = shlex.join(cmd)
-    sys.stdout.write("$ {}\n".format(printable))
-    sys.stdout.flush()
+    printable = _printable_cmd(cmd)
+    sys.stderr.write("$ {}\n".format(printable))
+    sys.stderr.flush()
     completed = subprocess.run(  # nosec B603
         list(cmd),
         cwd=cwd,
@@ -75,13 +108,20 @@ def _run_command(
 def _truncate_for_log(text: str, limit: int = 500) -> str:
     if len(text) <= limit:
         return text
-    return "{}...<truncated {} chars>".format(text[:limit], len(text) - limit)
+    head = limit // 2
+    tail = limit - head
+    omitted = len(text) - limit
+    return "{}...<truncated {} chars>...{}".format(
+        text[:head], omitted, text[-tail:]
+    )
 
 
 def _completed_process_output(completed: subprocess.CompletedProcess) -> str:
     parts = []
     stdout = (completed.stdout or "").strip()
     stderr = (completed.stderr or "").strip()
+    if stdout and stderr and stdout == stderr:
+        return "stdout+stderr:\n{}".format(stdout)
     if stdout:
         parts.append("stdout:\n{}".format(stdout))
     if stderr:
@@ -114,27 +154,32 @@ def _is_truthy(value: str) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _looks_like_ssh_public_key(text: str) -> bool:
+    head = text.strip().split()
+    return bool(head) and head[0].startswith(("ssh-", "ecdsa-", "sk-ssh-", "sk-ecdsa-"))
+
+
 def _validate_identity_and_signing():
     _print_step("Validating GitHub/git identity and signing configuration")
     gh_user = _active_gh_user()
-    if gh_user != EXPECTED_GH_USER:
+    if gh_user != GH_USER:
         raise CommandError(
             "Active gh user is '{}' (expected '{}').".format(
-                gh_user or "<empty>", EXPECTED_GH_USER
+                gh_user or "<empty>", GH_USER
             )
         )
     git_user = _git_config_get("user.name")
-    if git_user != EXPECTED_GIT_USER:
+    if git_user != GIT_NAME:
         raise CommandError(
             "git user.name is '{}' (expected '{}').".format(
-                git_user or "<empty>", EXPECTED_GIT_USER
+                git_user or "<empty>", GIT_NAME
             )
         )
     git_email = _git_config_get("user.email")
-    if git_email != EXPECTED_GIT_EMAIL:
+    if git_email != GIT_EMAIL:
         raise CommandError(
             "git user.email is '{}' (expected '{}').".format(
-                git_email or "<empty>", EXPECTED_GIT_EMAIL
+                git_email or "<empty>", GIT_EMAIL
             )
         )
     signing_key = _git_config_get("user.signingkey")
@@ -148,6 +193,11 @@ def _validate_identity_and_signing():
                     signing_key_path
                 )
             )
+    elif not _looks_like_ssh_public_key(signing_key):
+        raise CommandError(
+            "git user.signingkey is set but is neither a readable path nor an "
+            "SSH public key body: {!r}".format(signing_key[:80])
+        )
     if not _is_truthy(_git_config_get("commit.gpgsign")):
         raise CommandError(
             "git commit.gpgsign must be enabled to ensure signed commits."
@@ -158,7 +208,9 @@ def _gh_json(args: Sequence[str]):
     completed = _run_command(["gh"] + list(args), check=True, capture_output=True)
     raw = (completed.stdout or "").strip()
     if not raw:
-        return []
+        raise CommandError(
+            "gh command returned empty JSON output: gh {}".format(shlex.join(args))
+        )
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -191,45 +243,51 @@ def _gh_json_allow_empty(args: Sequence[str], *, empty_error_text: str = ""):
     )
 
 
-def _gh_login() -> str:
-    completed = _run_command(
-        ["gh", "api", "user", "--jq", ".login"], check=True, capture_output=True
-    )
-    return (completed.stdout or "").strip()
-
-
 def _ensure_runtime_identity():
-    if not os.path.exists(REQUIRED_AUTH_KEY):
+    if not os.path.exists(SSH_AUTH_KEY):
         raise CommandError(
-            "Required SSH auth key is missing: {}".format(REQUIRED_AUTH_KEY)
+            "Required SSH auth key is missing: {}".format(SSH_AUTH_KEY)
         )
-    if not os.path.exists(REQUIRED_SIGNING_KEY):
+    if not os.path.exists(SSH_SIGNING_KEY):
         raise CommandError(
-            "Required SSH signing key is missing: {}".format(REQUIRED_SIGNING_KEY)
+            "Required SSH signing key is missing: {}".format(SSH_SIGNING_KEY)
         )
-    _print_step("Ensuring GitHub login is '{}'".format(REQUIRED_GH_USER))
-    gh_login = _gh_login()
-    if gh_login != REQUIRED_GH_USER:
+    _print_step("Ensuring GitHub login is '{}'".format(GH_USER))
+    gh_login = _active_gh_user()
+    if gh_login != GH_USER:
         raise CommandError(
-            "gh is authenticated as '{}' instead of '{}'.".format(
-                gh_login, REQUIRED_GH_USER
-            )
+            "gh is authenticated as '{}' instead of '{}'.".format(gh_login, GH_USER)
         )
     _print_step(
-        "Setting git identity and SSH/signing keys for '{}'".format(REQUIRED_GH_USER)
+        "Setting git identity and SSH/signing keys for '{}'".format(GH_USER)
     )
     _run_command(
-        ["git", "config", "user.name", REQUIRED_GIT_NAME],
+        ["git", "config", "user.name", GIT_NAME],
         check=True,
         capture_output=True,
     )
     _run_command(
-        ["git", "config", "user.email", REQUIRED_GIT_EMAIL],
+        ["git", "config", "user.email", GIT_EMAIL],
         check=True,
         capture_output=True,
     )
     _run_command(
-        ["git", "config", "core.sshCommand", REQUIRED_SSH_COMMAND],
+        ["git", "config", "core.sshCommand", SSH_COMMAND],
+        check=True,
+        capture_output=True,
+    )
+    _run_command(
+        ["git", "config", "gpg.format", "ssh"],
+        check=True,
+        capture_output=True,
+    )
+    _run_command(
+        ["git", "config", "user.signingkey", SSH_SIGNING_KEY],
+        check=True,
+        capture_output=True,
+    )
+    _run_command(
+        ["git", "config", "commit.gpgsign", "true"],
         check=True,
         capture_output=True,
     )
@@ -326,7 +384,7 @@ def _prepare_pr_for_merge(pr_ref: str):
     _sign_off_pr(pr_ref)
     _run_command(["git", "config", "gpg.format", "ssh"], check=True, capture_output=True)
     _run_command(
-        ["git", "config", "user.signingkey", REQUIRED_SIGNING_KEY],
+        ["git", "config", "user.signingkey", SSH_SIGNING_KEY],
         check=True,
         capture_output=True,
     )
@@ -355,23 +413,65 @@ def _slug(value: str) -> str:
     return slug or "unknown"
 
 
-def _acquire_pr_loop_lock(pr_number: Optional[int]):
-    if pr_number is None:
+class _LoopLock:
+    """Advisory lock keyed by PR number (or branch fallback)."""
+
+    def __init__(self, handle, path: str):
+        self.handle = handle
+        self.path = path
+
+    def release(self):
+        try:
+            try:
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        finally:
+            try:
+                self.handle.close()
+            except OSError:
+                pass
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+
+def _acquire_loop_lock(
+    *, pr_number: Optional[int], branch_fallback: Optional[str] = None
+) -> Optional["_LoopLock"]:
+    if pr_number is not None:
+        key = "pr-{}".format(pr_number)
+    elif branch_fallback:
+        key = "branch-{}".format(_slug(branch_fallback))
+    else:
         return None
-    lock_path = "/tmp/codex-ralph-loop-pr-{}.lock".format(pr_number)
-    lock_handle = open(lock_path, "w", encoding="utf-8")
+    lock_path = os.path.join(
+        tempfile.gettempdir(), "codex-ralph-loop-{}.lock".format(key)
+    )
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    handle = os.fdopen(fd, "r+", encoding="utf-8")
     try:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        sys.stdout.write("{}\n".format(LOOP_ALREADY_RUNNING_MESSAGE))
-        sys.stdout.flush()
-        lock_handle.close()
-        raise SystemExit(0)
-    lock_handle.seek(0)
-    lock_handle.truncate(0)
-    lock_handle.write("{}\n".format(os.getpid()))
-    lock_handle.flush()
-    return lock_handle
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.stderr.write("{}\n".format(LOOP_ALREADY_RUNNING_MESSAGE))
+            sys.stderr.flush()
+            handle.close()
+            raise SystemExit(0)
+        handle.seek(0)
+        handle.truncate(0)
+        handle.write("{}\n".format(os.getpid()))
+        handle.flush()
+    except SystemExit:
+        raise
+    except BaseException:
+        try:
+            handle.close()
+        except OSError:
+            pass
+        raise
+    return _LoopLock(handle, lock_path)
 
 
 def _worktree_path(*, worktree_root: str, pr_number: int, branch: str) -> str:
@@ -556,21 +656,31 @@ def _run_local_quality_gates() -> Tuple[bool, str]:
     return True, ""
 
 
-def _reset_generated_changes():
-    if not _working_tree_dirty():
+def _reset_generated_changes(target_sha: Optional[str] = None):
+    target = target_sha or "HEAD"
+    head_sha = _git_head_sha()
+    dirty = _working_tree_dirty()
+    if not dirty and target_sha and head_sha == target_sha:
+        return
+    if not dirty and not target_sha:
         return
     _print_step(
-        "Resetting generated changes that were not useful (git reset --hard + git clean -fd)"
+        "Resetting generated changes (git reset --hard {} + git clean -fd)".format(
+            target
+        )
     )
-    _run_command(["git", "reset", "--hard", "HEAD"], check=True, capture_output=True)
+    _run_command(["git", "reset", "--hard", target], check=True, capture_output=True)
     _run_command(["git", "clean", "-fd"], check=True, capture_output=True)
 
 
 def _extract_yes_no_marker(*, marker_regex: str, text: str) -> Optional[bool]:
-    match = re.search(marker_regex, text, flags=re.IGNORECASE | re.MULTILINE)
-    if not match:
+    matches = re.findall(marker_regex, text, flags=re.IGNORECASE)
+    if not matches:
         return None
-    return match.group(1).lower() == "yes"
+    last = matches[-1]
+    if isinstance(last, tuple):
+        last = next((g for g in last if g), "")
+    return last.lower() == "yes"
 
 
 def _codex_exec_with_marker(
@@ -578,42 +688,31 @@ def _codex_exec_with_marker(
     prompt: str,
     marker_regex: str,
     model: Optional[str],
+    sandbox: str = "danger-full-access",
 ) -> Tuple[Optional[bool], str]:
-    with tempfile.NamedTemporaryFile(
-        mode="w", prefix="codex-last-msg-", suffix=".txt", delete=False
-    ) as temp_file:
-        temp_path = temp_file.name
-    cmd: List[str] = [
-        "codex",
-        "--ask-for-approval",
-        "never",
-        "--sandbox",
-        "danger-full-access",
-        "exec",
-        "-o",
-        temp_path,
-    ]
-    if model:
-        cmd.extend(["--model", model])
-    cmd.append(prompt)
-    completed = _run_command(cmd, check=True, capture_output=True)
-    try:
-        with open(temp_path, "r", encoding="utf-8") as handle:
-            last_message = handle.read().strip()
-    finally:
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
-    combined_text = "\n".join(
-        [
-            last_message,
-            (completed.stdout or "").strip(),
-            (completed.stderr or "").strip(),
+    with tempfile.TemporaryDirectory(prefix="codex-last-msg-") as tmp_dir:
+        temp_path = os.path.join(tmp_dir, "out.txt")
+        cmd: List[str] = [
+            "codex",
+            "--ask-for-approval",
+            "never",
+            "--sandbox",
+            sandbox,
+            "exec",
+            "-o",
+            temp_path,
         ]
-    ).strip()
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append(prompt)
+        _run_command(cmd, check=True, capture_output=True)
+        try:
+            with open(temp_path, "r", encoding="utf-8") as handle:
+                last_message = handle.read().strip()
+        except FileNotFoundError:
+            last_message = ""
     marker_value = _extract_yes_no_marker(
-        marker_regex=marker_regex, text=combined_text
+        marker_regex=marker_regex, text=last_message
     )
     return marker_value, last_message
 
@@ -686,9 +785,19 @@ def _run_pre_push_review_gate(*, base: str, model: Optional[str]) -> bool:
     _print_step(
         "Codex marker output: {}".format(_truncate_for_log(last_message or "<empty>"))
     )
-    if marker_value is None:
-        raise CommandError("Codex did not return PRE_PUSH_REVIEW_OK marker.")
-    return marker_value
+    if marker_value is not None:
+        return marker_value
+    inferred = _infer_review_pass_without_marker(last_message)
+    if inferred is None:
+        raise CommandError(
+            "Codex did not return PRE_PUSH_REVIEW_OK marker and pass/fail could not be inferred."
+        )
+    _print_step(
+        "PRE_PUSH_REVIEW_OK marker missing; inferred PRE_PUSH_REVIEW_OK={} from Codex text.".format(
+            "yes" if inferred else "no"
+        )
+    )
+    return inferred
 
 
 def _run_local_quality_fix_round(
@@ -748,11 +857,14 @@ def _commit_and_push(
     require_review_gate: bool,
     review_gate_after_quality_fix: bool,
     max_local_quality_rounds: int,
+    pre_round_sha: Optional[str] = None,
 ) -> str:
     local_quality_round = 0
     review_gate_needed = require_review_gate
     while True:
-        if not _working_tree_dirty():
+        head_sha = _git_head_sha()
+        has_new_commits = bool(pre_round_sha) and head_sha != pre_round_sha
+        if not _working_tree_dirty() and not has_new_commits:
             _print_step("No changes to commit.")
             return "no_changes"
         if review_gate_needed and not _run_pre_push_review_gate(
@@ -762,7 +874,7 @@ def _commit_and_push(
             _print_step(
                 "Pre-push review found actionable issues; discarding generated changes."
             )
-            _reset_generated_changes()
+            _reset_generated_changes(pre_round_sha)
             return "discarded"
         gates_ok, failure_summary = _run_local_quality_gates()
         if gates_ok:
@@ -771,7 +883,7 @@ def _commit_and_push(
             max_local_quality_rounds > 0
             and local_quality_round >= max_local_quality_rounds
         ):
-            _reset_generated_changes()
+            _reset_generated_changes(pre_round_sha)
             raise CommandError(
                 "Local quality loop exhausted {} repair rounds during {}.".format(
                     max_local_quality_rounds,
@@ -790,7 +902,7 @@ def _commit_and_push(
                     local_quality_round
                 )
             )
-            _reset_generated_changes()
+            _reset_generated_changes(pre_round_sha)
             return "discarded"
         if review_gate_after_quality_fix:
             review_gate_needed = True
@@ -799,29 +911,34 @@ def _commit_and_push(
                 local_quality_round
             )
         )
-    _print_step("Committing Codex-generated changes")
-    _run_command(["git", "add", "-A"], check=True, capture_output=True)
-    _run_command(
-        [
-            "git",
-            "commit",
-            "--signoff",
-            "-S",
-            "-m",
-            "fix: codex loop {}".format(iteration_label),
-            "-m",
-            COAUTHOR_LINE,
-        ],
-        check=True,
-        capture_output=True,
-    )
+    if _working_tree_dirty():
+        _print_step("Committing Codex-generated changes")
+        _run_command(["git", "add", "-A"], check=True, capture_output=True)
+        _run_command(
+            [
+                "git",
+                "commit",
+                "--signoff",
+                "-S",
+                "-m",
+                "fix: codex loop {}".format(iteration_label),
+                "-m",
+                COAUTHOR_LINE,
+            ],
+            check=True,
+            capture_output=True,
+        )
+    else:
+        _print_step(
+            "No working-tree changes to commit; pushing existing Codex commits."
+        )
     _print_step("Pushing branch {}".format(branch))
     _run_command(["git", "push", "origin", branch], check=True, capture_output=True)
     return "committed"
 
 
-def _pr_view(pr_ref: str):
-    return _gh_json(
+def _pr_view(pr_ref: str) -> dict:
+    data = _gh_json(
         [
             "pr",
             "view",
@@ -830,29 +947,31 @@ def _pr_view(pr_ref: str):
             "number,url,state,headRefName,baseRefName,isDraft",
         ]
     )
+    if not isinstance(data, dict):
+        raise CommandError(
+            "Unexpected gh pr view response shape: expected object, got {}".format(
+                type(data).__name__
+            )
+        )
+    return data
 
 
 def _pr_checks(branch: str, required_only: bool):
-    args = [
-        "pr",
-        "checks",
-        branch,
-        "--json",
-        "name,bucket,state,link,workflow",
-    ]
+    args = ["pr", "checks"]
     if required_only:
-        args.insert(3, "--required")
+        args.append("--required")
+    args.extend([branch, "--json", "name,bucket,state,link,workflow"])
     return _gh_json_allow_empty(
         args,
         empty_error_text="no required checks reported",
     )
 
 
-def _required_checks(branch: str):
+def _required_checks(branch: str) -> Tuple[list, bool]:
     checks = _pr_checks(branch, required_only=True)
     if checks:
-        return checks
-    return _pr_checks(branch, required_only=False)
+        return checks, True
+    return _pr_checks(branch, required_only=False), False
 
 
 def _bucket_summary(checks) -> str:
@@ -866,15 +985,27 @@ def _bucket_summary(checks) -> str:
     return ", ".join(parts)
 
 
-def _failing_checks(checks):
-    failing = []
-    for check in checks:
-        if check.get("bucket") in ("fail", "cancel"):
-            name = check.get("name", "<unknown>")
-            state = check.get("state", "<unknown>")
-            link = check.get("link", "")
-            failing.append("- {} [{}] {}".format(name, state, link))
-    return "\n".join(failing) if failing else "- <none>"
+def _failing_check_records(checks: Sequence[dict]) -> List[dict]:
+    return [
+        {
+            "name": check.get("name", "<unknown>"),
+            "state": check.get("state", "<unknown>"),
+            "link": check.get("link", ""),
+            "workflow": check.get("workflow", ""),
+        }
+        for check in checks
+        if check.get("bucket") in ("fail", "cancel")
+    ]
+
+
+def _format_failing_checks(records: Sequence[dict]) -> str:
+    if not records:
+        return "- <none>"
+    lines = []
+    for rec in records:
+        link = " {}".format(rec["link"]) if rec.get("link") else ""
+        lines.append("- {} [{}]{}".format(rec["name"], rec["state"], link))
+    return "\n".join(lines)
 
 
 def _wait_for_required_checks_green(
@@ -882,22 +1013,29 @@ def _wait_for_required_checks_green(
     branch: str,
     poll_seconds: int,
     timeout_seconds: int,
+    treat_optional_as_blocking: bool = True,
 ) -> Tuple[bool, list]:
     _print_step("Waiting for required checks on PR branch {}".format(branch))
-    started = time.time()
+    started = time.monotonic()
     while True:
-        checks = _required_checks(branch)
+        checks, were_required = _required_checks(branch)
         if not checks:
-            _print_step("No required checks reported; treating as green.")
+            _print_step("No checks reported; treating as green.")
+            return True, checks
+        if not were_required and not treat_optional_as_blocking:
+            _print_step(
+                "No required checks reported; ignoring optional check failures."
+            )
             return True, checks
         summary = _bucket_summary(checks)
-        _print_step("Required check buckets: {}".format(summary))
+        scope = "Required" if were_required else "All (no required reported)"
+        _print_step("{} check buckets: {}".format(scope, summary))
         buckets = {check.get("bucket") for check in checks}
         if buckets.issubset({"pass", "skipping"}):
             return True, checks
         if "pending" not in buckets:
             return False, checks
-        if (time.time() - started) > timeout_seconds:
+        if (time.monotonic() - started) > timeout_seconds:
             raise CommandError(
                 "Timed out waiting for required checks after {}s.".format(
                     timeout_seconds
@@ -913,7 +1051,7 @@ def _run_ci_fix_round(
     model: Optional[str],
 ) -> bool:
     _print_step("Codex CI repair round {}".format(round_number))
-    failing_summary = _failing_checks(checks)
+    failing_summary = _format_failing_checks(_failing_check_records(checks))
     prompt = textwrap.dedent(
         """
         Required GitHub checks are failing on this branch.
@@ -977,6 +1115,34 @@ def _merge_pr(pr_ref: str):
     )
 
 
+def _nonneg_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            "expected a non-negative integer, got {!r}".format(value)
+        )
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            "expected a non-negative integer, got {}".format(parsed)
+        )
+    return parsed
+
+
+def _pos_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            "expected a positive integer, got {!r}".format(value)
+        )
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(
+            "expected a positive integer, got {}".format(parsed)
+        )
+    return parsed
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a Codex /review repair loop, then CI repair, then rebase+merge."
@@ -992,19 +1158,19 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-review-rounds",
-        type=int,
+        type=_nonneg_int,
         default=0,
         help="Maximum Codex review/fix rounds before aborting. Use 0 for unlimited.",
     )
     parser.add_argument(
         "--max-ci-rounds",
-        type=int,
+        type=_nonneg_int,
         default=0,
         help="Maximum Codex CI fix rounds before aborting. Use 0 for unlimited.",
     )
     parser.add_argument(
         "--max-local-quality-rounds",
-        type=int,
+        type=_nonneg_int,
         default=0,
         help=(
             "Maximum Codex repair rounds for local just ci/test failures before aborting. "
@@ -1013,15 +1179,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--poll-seconds",
-        type=int,
+        type=_pos_int,
         default=20,
-        help="Polling interval for required checks.",
+        help="Polling interval for required checks (positive integer seconds).",
     )
     parser.add_argument(
         "--checks-timeout-seconds",
-        type=int,
+        type=_pos_int,
         default=5400,
-        help="Timeout for a single required-check wait cycle.",
+        help="Timeout for a single required-check wait cycle (positive integer seconds).",
     )
     parser.add_argument(
         "--model",
@@ -1055,12 +1221,10 @@ def main() -> int:
         current_branch = _git_branch()
         pr_ref = str(args.pr) if args.pr is not None else current_branch
         pr_data = _pr_view(pr_ref)
-        if not pr_data:
-            raise CommandError("No PR found for reference '{}'.".format(pr_ref))
         pr_number = pr_data.get("number")
         if not isinstance(pr_number, int):
             raise CommandError("Could not resolve PR number for '{}'.".format(pr_ref))
-        pr_loop_lock = _acquire_pr_loop_lock(pr_number)
+        pr_loop_lock = _acquire_loop_lock(pr_number=pr_number)
         if pr_data.get("state") != "OPEN":
             raise CommandError(
                 "PR {} is not open (state={}).".format(
@@ -1117,6 +1281,7 @@ def main() -> int:
         last_review_round = 0
         for round_number in _round_numbers(args.max_review_rounds):
             last_review_round = round_number
+            pre_round_sha = _git_head_sha()
             review_passed = _run_review_fix_round(round_number, args.base, args.model)
             if not review_passed:
                 commit_state = _commit_and_push(
@@ -1127,6 +1292,7 @@ def main() -> int:
                     require_review_gate=False,
                     review_gate_after_quality_fix=False,
                     max_local_quality_rounds=args.max_local_quality_rounds,
+                    pre_round_sha=pre_round_sha,
                 )
                 if commit_state == "discarded":
                     _print_step(
@@ -1136,7 +1302,7 @@ def main() -> int:
                     )
                     continue
                 if commit_state == "no_changes":
-                    _reset_generated_changes()
+                    _reset_generated_changes(pre_round_sha)
                 _print_step(
                     "Review round {} still has actionable findings; retrying with a fresh context window and Codex session.".format(
                         round_number
@@ -1151,6 +1317,7 @@ def main() -> int:
                 require_review_gate=False,
                 review_gate_after_quality_fix=True,
                 max_local_quality_rounds=args.max_local_quality_rounds,
+                pre_round_sha=pre_round_sha,
             )
             if commit_state == "discarded":
                 review_passed = False
@@ -1167,8 +1334,6 @@ def main() -> int:
                     )
                 )
             break
-            if args.max_review_rounds > 0 and round_number >= args.max_review_rounds:
-                break
         if not review_passed:
             if args.max_review_rounds > 0:
                 raise CommandError(
@@ -1193,13 +1358,14 @@ def main() -> int:
             )
             if ci_green:
                 break
+            pre_round_sha = _git_head_sha()
             ready = _run_ci_fix_round(
                 round_number=round_number,
                 checks=checks,
                 model=args.model,
             )
             if not ready:
-                _reset_generated_changes()
+                _reset_generated_changes(pre_round_sha)
                 _print_step(
                     "CI round {} did not produce a useful fix; retrying with a fresh context window and Codex session.".format(
                         round_number
@@ -1214,6 +1380,7 @@ def main() -> int:
                 require_review_gate=True,
                 review_gate_after_quality_fix=True,
                 max_local_quality_rounds=args.max_local_quality_rounds,
+                pre_round_sha=pre_round_sha,
             )
             if commit_state == "discarded":
                 _print_step(
@@ -1229,8 +1396,6 @@ def main() -> int:
                     )
                 )
                 continue
-            if args.max_ci_rounds > 0 and round_number >= args.max_ci_rounds:
-                break
         if not ci_green:
             if args.max_ci_rounds > 0:
                 raise CommandError(
@@ -1261,7 +1426,7 @@ def main() -> int:
         return 0
     finally:
         if pr_loop_lock is not None:
-            pr_loop_lock.close()
+            pr_loop_lock.release()
 
 
 if __name__ == "__main__":
