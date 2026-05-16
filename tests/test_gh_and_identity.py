@@ -473,6 +473,33 @@ def test_list_open_prs_rejects_non_list_shape(monkeypatch):
         gh_ops._list_open_prs("main")
 
 
+def test_pr_checks_soft_fails_coderabbit_insufficient_credits(monkeypatch):
+    monkeypatch.setattr(
+        gh_ops,
+        "_gh_json_allow_empty",
+        lambda *_a, **_kw: [
+            {
+                "name": "CodeRabbit",
+                "bucket": "fail",
+                "description": "Insufficient review credits to perform this review.",
+            },
+            {"name": "unit", "bucket": "pass"},
+            {
+                "name": "CodeRabbit",
+                "bucket": "fail",
+                "description": "Something unrelated broke",
+            },
+        ],
+    )
+    result = gh_ops._pr_checks("feature", required_only=False)
+    coderabbit_first = next(c for c in result if c["name"] == "CodeRabbit" and "Insufficient" in c.get("description", ""))
+    coderabbit_other = next(c for c in result if c["name"] == "CodeRabbit" and "Something" in c.get("description", ""))
+    assert coderabbit_first["bucket"] == "skipping"
+    assert coderabbit_first["soft_failed"] is True
+    assert coderabbit_other["bucket"] == "fail"
+    assert "soft_failed" not in coderabbit_other
+
+
 def test_required_checks_falls_back_to_optional_checks(monkeypatch, spy):
     pr_checks = spy(side_effect=[[], [{"name": "unit", "bucket": "pass"}]])
     monkeypatch.setattr(gh_ops, "_pr_checks", pr_checks)

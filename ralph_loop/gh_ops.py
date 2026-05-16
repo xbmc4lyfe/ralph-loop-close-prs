@@ -418,16 +418,50 @@ def _pr_view(pr_ref: str) -> dict:
     return data
 
 
+_SOFT_FAIL_PATTERNS = (
+    # CodeRabbit fails its check with this text when the org has run out of
+    # review credits. The repo's review quality doesn't change with it, so
+    # treat that specific case as if the check were skipping.
+    ("coderabbit", "insufficient review credits"),
+)
+
+
+def _is_soft_fail_check(check: dict) -> bool:
+    name = (check.get("name") or "").lower()
+    description = " ".join(
+        str(check.get(field) or "")
+        for field in ("description", "summary", "title", "state")
+    ).lower()
+    for name_needle, body_needle in _SOFT_FAIL_PATTERNS:
+        if name_needle in name and body_needle in description:
+            return True
+    return False
+
+
+def _apply_soft_fail_filter(checks: list) -> list:
+    filtered = []
+    for check in checks:
+        if check.get("bucket") == "fail" and _is_soft_fail_check(check):
+            new_check = dict(check)
+            new_check["bucket"] = "skipping"
+            new_check["soft_failed"] = True
+            filtered.append(new_check)
+        else:
+            filtered.append(check)
+    return filtered
+
+
 def _pr_checks(branch: str, required_only: bool):
     args = ["pr", "checks"]
     if required_only:
         args.append("--required")
-    args.extend([branch, "--json", "name,bucket,state,link,workflow"])
-    return _gh_json_allow_empty(
+    args.extend([branch, "--json", "name,bucket,state,link,workflow,description"])
+    checks = _gh_json_allow_empty(
         args,
         empty_error_text="no required checks reported",
         pending_on_exit_8=True,
     )
+    return _apply_soft_fail_filter(checks or [])
 
 
 def _required_checks(branch: str) -> Tuple[list, bool]:

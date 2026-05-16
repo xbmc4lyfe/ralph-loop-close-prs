@@ -298,20 +298,21 @@ def _supervisor_wait(event: "threading.Event", timeout: float) -> bool:
 def _post_addressed_comment_replies(
     pr_ref: str, addressed: List[Tuple[int, str]], round_number: int
 ) -> None:
-    for comment_id, note in addressed:
+    for comment_id, summary in addressed:
+        summary_clean = (summary or "").strip()
+        if not summary_clean:
+            summary_clean = "(Codex did not provide a fix summary for this comment.)"
         body = (
-            "Ralph automated review/fix round {round_n}: {note}\n\n"
-            "Pushed a fix that addresses this comment. Please re-review.".format(
-                round_n=round_number,
-                note=note or "(no per-comment note provided by Codex)",
-            )
-        )
+            "**Ralph automated review/fix round {round_n}** — pushed a fix "
+            "addressing this comment.\n\n"
+            "**Summary of the change:**\n\n{summary}\n\n"
+            "Please re-review the latest commit."
+        ).format(round_n=round_number, summary=summary_clean)
         ok = _reply_to_pr_review_comment(pr_ref, comment_id, body)
         if ok:
             _print_step(
-                "Replied to PR review comment #{} acknowledging fix.".format(
-                    comment_id
-                )
+                "Replied to PR review comment #{} with fix summary "
+                "({} chars).".format(comment_id, len(body))
             )
         else:
             _print_step(

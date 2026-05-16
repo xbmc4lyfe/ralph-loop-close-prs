@@ -119,14 +119,46 @@ def _format_external_review_comments(comments: List[dict]) -> str:
 
 
 def _parse_addressed_comments(text: str) -> List[Tuple[int, str]]:
-    """Extract ADDRESSED_COMMENT=<id>: <note> lines from Codex output."""
-    addressed = []
-    for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-        match = re.match(r"ADDRESSED_COMMENT=(\d+)\s*:?\s*(.*)$", line)
-        if not match:
+    """Extract addressed-comment blocks from Codex output.
+
+    Supports two forms in priority order:
+
+    1. Multi-line block:
+       ADDRESSED_COMMENT_START=<id>
+       <summary lines>
+       ADDRESSED_COMMENT_END
+
+    2. Single-line fallback:
+       ADDRESSED_COMMENT=<id>: <note>
+    """
+    addressed: List[Tuple[int, str]] = []
+    lines = (text or "").splitlines()
+    i = 0
+    handled_ids: set = set()
+    while i < len(lines):
+        line = lines[i].strip()
+        block_match = re.match(r"ADDRESSED_COMMENT_START=(\d+)\s*$", line)
+        if block_match:
+            comment_id = int(block_match.group(1))
+            j = i + 1
+            buf: List[str] = []
+            while j < len(lines) and lines[j].strip() != "ADDRESSED_COMMENT_END":
+                buf.append(lines[j])
+                j += 1
+            summary = "\n".join(buf).strip()
+            if comment_id not in handled_ids:
+                addressed.append((comment_id, summary))
+                handled_ids.add(comment_id)
+            i = j + 1
             continue
-        addressed.append((int(match.group(1)), match.group(2).strip()))
+        single_match = re.match(r"ADDRESSED_COMMENT=(\d+)\s*:?\s*(.*)$", line)
+        if single_match:
+            comment_id = int(single_match.group(1))
+            note = single_match.group(2).strip()
+            if comment_id not in handled_ids:
+                addressed.append((comment_id, note))
+                handled_ids.add(comment_id)
+        i += 1
     return addressed
 
 
@@ -145,14 +177,20 @@ def _run_review_fix_round(
 
             Existing reviewer comments on this PR (from bots and humans). Treat
             each as additional findings to consider alongside /review. When you
-            make a code change that addresses one, write a line in your final
+            make a code change that addresses one, emit a block in your final
             response of the form:
 
-            ADDRESSED_COMMENT=<id>: <one-line summary of how the fix addresses it>
+            ADDRESSED_COMMENT_START=<id>
+            <multi-line summary explaining what you changed in the code, which
+            files/functions you touched, and why it resolves the reviewer's
+            concern>
+            ADDRESSED_COMMENT_END
 
-            Use one ADDRESSED_COMMENT line per comment you addressed. Place
-            them BEFORE the REVIEW_PASS line. If a comment doesn't apply or
-            you intentionally don't fix it, do not emit a line for it.
+            Emit one such block per comment you addressed, BEFORE the
+            REVIEW_PASS line. If a comment doesn't apply or you intentionally
+            don't fix it, do not emit a block for it. The summary will be
+            posted verbatim as a reply on the PR review comment, so write it
+            for a human reviewer who needs to verify the fix.
 
             Comments:
             """

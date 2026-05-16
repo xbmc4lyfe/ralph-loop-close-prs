@@ -191,7 +191,11 @@ def test_review_round_surfaces_external_comments_and_parses_addressed(
     def fake_exec(*, prompt, marker_regex, model):
         captured["prompt"] = prompt
         text = (
-            "ADDRESSED_COMMENT=12345: Redacted API key from logs in _maybe_refresh_caps.\n"
+            "ADDRESSED_COMMENT_START=12345\n"
+            "Wrapped the exception handler in _maybe_refresh_caps to redact\n"
+            "any apikey=... query string before logging.\n"
+            "Files: plugin.video.nzbdav/resources/lib/direct_indexers.py\n"
+            "ADDRESSED_COMMENT_END\n"
             "ADDRESSED_COMMENT=67890: Match by preset_id when id is empty.\n"
             "REVIEW_PASS=yes\n"
         )
@@ -220,13 +224,14 @@ def test_review_round_surfaces_external_comments_and_parses_addressed(
     )
 
     assert passed is True
-    assert addressed == [
-        (12345, "Redacted API key from logs in _maybe_refresh_caps."),
-        (67890, "Match by preset_id when id is empty."),
-    ]
+    assert len(addressed) == 2
+    assert addressed[0][0] == 12345
+    assert "redact" in addressed[0][1].lower()
+    assert "_maybe_refresh_caps" in addressed[0][1]
+    assert addressed[1] == (67890, "Match by preset_id when id is empty.")
     assert "COMMENT-12345" in captured["prompt"]
     assert "coderabbitai[bot]" in captured["prompt"]
-    assert "ADDRESSED_COMMENT" in captured["prompt"]
+    assert "ADDRESSED_COMMENT_START" in captured["prompt"]
 
 
 def test_pre_push_review_gate_uses_marker_and_inference(monkeypatch, spy):
