@@ -1202,6 +1202,7 @@ def test_fan_out_installs_sighup_reload_handler(monkeypatch, cli_args, tmp_path)
         return signal.SIG_DFL
 
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [42])
+    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
     monkeypatch.setattr(
         cli.subprocess, "Popen", lambda *a, **k: _FakeProc(pid=1, exit_after_polls=1)
     )
@@ -1244,6 +1245,7 @@ def test_fan_out_sighup_triggers_execv_with_supervisor_argv(
         pytest.skip("SIGHUP not available on this platform")
 
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [55])
+    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
 
     procs_made = []
 
@@ -1321,6 +1323,7 @@ def test_fan_out_sighup_triggers_execv_with_supervisor_argv(
 def test_fan_out_no_execv_when_normal_shutdown(monkeypatch, cli_args, tmp_path):
     """SIGINT/SIGTERM path must not call os.execv."""
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [77])
+    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
 
     def fake_popen(_cmd, **_kwargs):
         return _FakeProc(pid=600, exit_after_polls=99)
