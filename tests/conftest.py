@@ -89,7 +89,9 @@ class CliHarness:
         self.mark_review = Mock(name="cli._mark_pr_needs_review")
         self.rebase = Mock(name="cli._rebase_onto_base")
         self.git_head = Mock(return_value="sha", name="cli._git_head_sha")
-        self.review_round = Mock(return_value=True, name="cli._run_review_fix_round")
+        self.review_round = Mock(
+            return_value=(True, []), name="cli._run_review_fix_round"
+        )
         self.commit_push = Mock(return_value="no_changes", name="cli._commit_and_push")
         self.wait_checks = Mock(
             return_value=(True, [{"name": "unit", "bucket": "pass"}])
@@ -98,6 +100,12 @@ class CliHarness:
         self.reset_changes = Mock(name="cli._reset_generated_changes")
         self.prepare_merge = Mock(name="cli._prepare_pr_for_merge")
         self.merge_pr = Mock(name="cli._merge_pr")
+        self.pr_review_comments = Mock(
+            return_value=[], name="cli._pr_review_comments"
+        )
+        self.reply_review_comment = Mock(
+            return_value=True, name="cli._reply_to_pr_review_comment"
+        )
 
     def install(self):
         self.monkeypatch.setattr(cli, "_parse_args", self.parse_args)
@@ -127,6 +135,12 @@ class CliHarness:
         )
         self.monkeypatch.setattr(cli, "_prepare_pr_for_merge", self.prepare_merge)
         self.monkeypatch.setattr(cli, "_merge_pr", self.merge_pr)
+        self.monkeypatch.setattr(
+            cli, "_pr_review_comments", self.pr_review_comments
+        )
+        self.monkeypatch.setattr(
+            cli, "_reply_to_pr_review_comment", self.reply_review_comment
+        )
         return self
 
 

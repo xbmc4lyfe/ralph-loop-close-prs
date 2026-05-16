@@ -259,7 +259,7 @@ def test_main_review_loop_handles_discarded_and_no_changes_failures(
     commit_state, cli_harness
 ):
     harness = cli_harness()
-    harness.review_round.return_value = False
+    harness.review_round.return_value = (False, [])
     harness.commit_push.return_value = commit_state
 
     with pytest.raises(CommandError, match="Review loop exhausted"):
@@ -270,7 +270,7 @@ def test_main_review_loop_handles_discarded_and_no_changes_failures(
 
 def test_main_review_pass_discarded_keeps_loop_failed(cli_harness):
     harness = cli_harness()
-    harness.review_round.return_value = True
+    harness.review_round.return_value = (True, [])
     harness.commit_push.return_value = "discarded"
 
     with pytest.raises(CommandError, match="Review loop exhausted"):

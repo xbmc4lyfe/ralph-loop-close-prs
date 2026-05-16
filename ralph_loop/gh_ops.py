@@ -325,6 +325,80 @@ def _list_open_prs(base: str) -> list:
     return numbers
 
 
+def _pr_review_comments(pr_ref: str) -> list:
+    """Return unresolved line-level review comments on the PR."""
+    pr_number = int(pr_ref) if str(pr_ref).isdigit() else None
+    if pr_number is None:
+        pr_number = _pr_view(pr_ref).get("number")
+    if not isinstance(pr_number, int):
+        return []
+    completed = _gh_run_with_retry(
+        [
+            "api",
+            "--paginate",
+            "repos/{{owner}}/{{repo}}/pulls/{}/comments".format(pr_number),
+        ],
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        return []
+    raw = (completed.stdout or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    comments = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        comment_id = item.get("id")
+        if not isinstance(comment_id, int):
+            continue
+        body = (item.get("body") or "").strip()
+        if not body:
+            continue
+        comments.append(
+            {
+                "id": comment_id,
+                "user": (item.get("user") or {}).get("login", "<unknown>"),
+                "path": item.get("path") or "",
+                "line": item.get("line") or item.get("original_line") or 0,
+                "body": body,
+                "in_reply_to_id": item.get("in_reply_to_id"),
+            }
+        )
+    return comments
+
+
+def _reply_to_pr_review_comment(pr_ref: str, comment_id: int, body: str) -> bool:
+    """Reply to a PR review comment. Returns True on success."""
+    pr_number = int(pr_ref) if str(pr_ref).isdigit() else None
+    if pr_number is None:
+        pr_number = _pr_view(pr_ref).get("number")
+    if not isinstance(pr_number, int):
+        return False
+    completed = _gh_run_with_retry(
+        [
+            "api",
+            "-X",
+            "POST",
+            "repos/{{owner}}/{{repo}}/pulls/{}/comments/{}/replies".format(
+                pr_number, comment_id
+            ),
+            "-f",
+            "body={}".format(body),
+        ],
+        check=False,
+        capture_output=True,
+    )
+    return completed.returncode == 0
+
+
 def _pr_view(pr_ref: str) -> dict:
     data = _gh_json(
         [

@@ -99,22 +99,80 @@ def _infer_review_pass_without_marker(last_message: str) -> Optional[bool]:
     return None
 
 
-def _run_review_fix_round(round_number: int, base: str, model: Optional[str]) -> bool:
+def _format_external_review_comments(comments: List[dict]) -> str:
+    """Render PR review comments as a bullet list with COMMENT-<id> markers."""
+    lines = []
+    for comment in comments:
+        body = (comment.get("body") or "").strip()
+        first_lines = body.splitlines()[:6]
+        snippet = "\n    ".join(first_lines)
+        lines.append(
+            "- COMMENT-{id} from @{user} at {path}:{line}\n    {snippet}".format(
+                id=comment.get("id"),
+                user=comment.get("user", "<unknown>"),
+                path=comment.get("path", "<file>"),
+                line=comment.get("line", 0),
+                snippet=snippet,
+            )
+        )
+    return "\n".join(lines)
+
+
+def _parse_addressed_comments(text: str) -> List[Tuple[int, str]]:
+    """Extract ADDRESSED_COMMENT=<id>: <note> lines from Codex output."""
+    addressed = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        match = re.match(r"ADDRESSED_COMMENT=(\d+)\s*:?\s*(.*)$", line)
+        if not match:
+            continue
+        addressed.append((int(match.group(1)), match.group(2).strip()))
+    return addressed
+
+
+def _run_review_fix_round(
+    round_number: int,
+    base: str,
+    model: Optional[str],
+    external_comments: Optional[List[dict]] = None,
+) -> Tuple[bool, List[Tuple[int, str]]]:
     _print_step("Codex review/fix round {}".format(round_number))
     del base
-    prompt = textwrap.dedent(
-        """
-        Run `/review`.
-        If `/review` finds actionable issues, fix them in the current repository.
-        Do not commit or push.
-        Then run `/review` exactly one more time.
-        If no actionable issues remain after that second review, return:
-        REVIEW_PASS=yes
-        Otherwise return:
-        REVIEW_PASS=no
-        Respond with exactly one line and nothing else.
-        """
-    ).strip()
+    external_block = ""
+    if external_comments:
+        external_block = textwrap.dedent(
+            """
+
+            Existing reviewer comments on this PR (from bots and humans). Treat
+            each as additional findings to consider alongside /review. When you
+            make a code change that addresses one, write a line in your final
+            response of the form:
+
+            ADDRESSED_COMMENT=<id>: <one-line summary of how the fix addresses it>
+
+            Use one ADDRESSED_COMMENT line per comment you addressed. Place
+            them BEFORE the REVIEW_PASS line. If a comment doesn't apply or
+            you intentionally don't fix it, do not emit a line for it.
+
+            Comments:
+            """
+        ).rstrip() + "\n" + _format_external_review_comments(external_comments)
+    prompt = (
+        textwrap.dedent(
+            """
+            Run `/review`.
+            If `/review` finds actionable issues, fix them in the current repository.
+            Do not commit or push.
+            Then run `/review` exactly one more time.
+            If no actionable issues remain after that second review, end your
+            response with the line:
+            REVIEW_PASS=yes
+            Otherwise end with:
+            REVIEW_PASS=no
+            """
+        ).strip()
+        + external_block
+    )
     marker_value, last_message = _codex_exec_with_marker(
         prompt=prompt,
         marker_regex=r"REVIEW_PASS=(yes|no)",
@@ -125,8 +183,16 @@ def _run_review_fix_round(round_number: int, base: str, model: Optional[str]) ->
             _truncate_for_log(last_message or "<empty>")
         )
     )
+    addressed = _parse_addressed_comments(last_message or "")
+    if addressed:
+        _print_step(
+            "Codex reported addressing {} reviewer comment(s): {}".format(
+                len(addressed),
+                ", ".join("#{}".format(cid) for cid, _ in addressed),
+            )
+        )
     if marker_value is not None:
-        return marker_value
+        return marker_value, addressed
     inferred = _infer_review_pass_without_marker(last_message)
     if inferred is None:
         raise CommandError(
@@ -137,7 +203,7 @@ def _run_review_fix_round(round_number: int, base: str, model: Optional[str]) ->
             "yes" if inferred else "no"
         )
     )
-    return inferred
+    return inferred, addressed
 
 
 def _run_pre_push_review_gate(*, base: str, model: Optional[str]) -> bool:

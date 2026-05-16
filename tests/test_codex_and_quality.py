@@ -159,7 +159,9 @@ def test_review_round_uses_marker_inference_and_error_paths(monkeypatch, spy):
     run = spy(return_value=(True, "REVIEW_PASS=yes"))
     monkeypatch.setattr(codex_agent, "_codex_exec_with_marker", run)
 
-    assert codex_agent._run_review_fix_round(2, "main", "model") is True
+    passed, addressed = codex_agent._run_review_fix_round(2, "main", "model")
+    assert passed is True
+    assert addressed == []
     assert "/review" in run.call_args.kwargs["prompt"]
     assert "--base" not in run.call_args.kwargs["prompt"]
     assert "Do not commit or push." in run.call_args.kwargs["prompt"]
@@ -169,7 +171,8 @@ def test_review_round_uses_marker_inference_and_error_paths(monkeypatch, spy):
         "_codex_exec_with_marker",
         spy(return_value=(None, "No findings.")),
     )
-    assert codex_agent._run_review_fix_round(2, "main", None) is True
+    passed, _ = codex_agent._run_review_fix_round(2, "main", None)
+    assert passed is True
 
     monkeypatch.setattr(
         codex_agent,
@@ -178,6 +181,52 @@ def test_review_round_uses_marker_inference_and_error_paths(monkeypatch, spy):
     )
     with pytest.raises(CommandError, match="REVIEW_PASS marker"):
         codex_agent._run_review_fix_round(2, "main", None)
+
+
+def test_review_round_surfaces_external_comments_and_parses_addressed(
+    monkeypatch, spy
+):
+    captured = {}
+
+    def fake_exec(*, prompt, marker_regex, model):
+        captured["prompt"] = prompt
+        text = (
+            "ADDRESSED_COMMENT=12345: Redacted API key from logs in _maybe_refresh_caps.\n"
+            "ADDRESSED_COMMENT=67890: Match by preset_id when id is empty.\n"
+            "REVIEW_PASS=yes\n"
+        )
+        return True, text
+
+    monkeypatch.setattr(codex_agent, "_codex_exec_with_marker", fake_exec)
+    external = [
+        {
+            "id": 12345,
+            "user": "coderabbitai[bot]",
+            "path": "foo.py",
+            "line": 42,
+            "body": "API key leaked",
+        },
+        {
+            "id": 67890,
+            "user": "codacy[bot]",
+            "path": "bar.py",
+            "line": 99,
+            "body": "Duplicate row matcher",
+        },
+    ]
+
+    passed, addressed = codex_agent._run_review_fix_round(
+        1, "main", None, external_comments=external
+    )
+
+    assert passed is True
+    assert addressed == [
+        (12345, "Redacted API key from logs in _maybe_refresh_caps."),
+        (67890, "Match by preset_id when id is empty."),
+    ]
+    assert "COMMENT-12345" in captured["prompt"]
+    assert "coderabbitai[bot]" in captured["prompt"]
+    assert "ADDRESSED_COMMENT" in captured["prompt"]
 
 
 def test_pre_push_review_gate_uses_marker_and_inference(monkeypatch, spy):

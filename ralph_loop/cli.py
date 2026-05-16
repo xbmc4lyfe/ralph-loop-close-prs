@@ -19,8 +19,10 @@ from .gh_ops import (
     _list_open_prs,
     _mark_pr_needs_review,
     _merge_pr,
+    _pr_review_comments,
     _pr_view,
     _prepare_pr_for_merge,
+    _reply_to_pr_review_comment,
 )
 from .git_ops import (
     _git_branch,
@@ -291,6 +293,32 @@ def _passthrough_args(argv: List[str]) -> List[str]:
 
 def _supervisor_wait(event: "threading.Event", timeout: float) -> bool:
     return event.wait(timeout=timeout)
+
+
+def _post_addressed_comment_replies(
+    pr_ref: str, addressed: List[Tuple[int, str]], round_number: int
+) -> None:
+    for comment_id, note in addressed:
+        body = (
+            "Ralph automated review/fix round {round_n}: {note}\n\n"
+            "Pushed a fix that addresses this comment. Please re-review.".format(
+                round_n=round_number,
+                note=note or "(no per-comment note provided by Codex)",
+            )
+        )
+        ok = _reply_to_pr_review_comment(pr_ref, comment_id, body)
+        if ok:
+            _print_step(
+                "Replied to PR review comment #{} acknowledging fix.".format(
+                    comment_id
+                )
+            )
+        else:
+            _print_step(
+                "Failed to reply to PR review comment #{} (continuing).".format(
+                    comment_id
+                )
+            )
 
 
 def _spawn_child(
@@ -598,7 +626,26 @@ def main() -> int:
             _check_wall_clock(deadline)
             last_review_round = round_number
             pre_round_sha = _git_head_sha()
-            review_passed = _run_review_fix_round(round_number, args.base, args.model)
+            try:
+                external_comments = _pr_review_comments(pr_target)
+            except CommandError as exc:
+                _print_step(
+                    "Could not fetch existing PR review comments ({}); "
+                    "proceeding without them.".format(exc)
+                )
+                external_comments = []
+            if external_comments:
+                _print_step(
+                    "Surfacing {} existing PR review comment(s) to Codex.".format(
+                        len(external_comments)
+                    )
+                )
+            review_passed, addressed = _run_review_fix_round(
+                round_number,
+                args.base,
+                args.model,
+                external_comments=external_comments,
+            )
             if not review_passed:
                 commit_state = _commit_and_push(
                     "review round {}".format(round_number),
@@ -620,6 +667,8 @@ def main() -> int:
                     continue
                 if commit_state == "no_changes":
                     _reset_generated_changes(pre_round_sha)
+                else:
+                    _post_addressed_comment_replies(pr_target, addressed, round_number)
                 _print_step(
                     "Review round {} still has actionable findings; retrying with a fresh context window and Codex session.".format(
                         round_number
@@ -651,6 +700,8 @@ def main() -> int:
                         round_number
                     )
                 )
+            else:
+                _post_addressed_comment_replies(pr_target, addressed, round_number)
             break
         if not review_passed:
             if args.max_review_rounds > 0:
