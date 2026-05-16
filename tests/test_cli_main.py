@@ -2,6 +2,7 @@ import argparse
 import os
 import runpy
 import signal
+import subprocess
 import sys
 
 import pytest
@@ -345,6 +346,239 @@ def test_compatibility_script_exits_with_main_status(monkeypatch):
         runpy.run_path(path, run_name="__main__")
 
     assert raised.value.code == 0
+
+
+def test_parse_args_accepts_directory_positional_and_all_prs_flag(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["ralph", "--all-prs", "/tmp/some-dir"])
+    args = cli._parse_args()
+    assert args.all_prs is True
+    assert args.directory == "/tmp/some-dir"
+    assert args.pr is None
+
+
+def test_parse_args_defaults_directory_and_all_prs_off(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["ralph"])
+    args = cli._parse_args()
+    assert args.directory is None
+    assert args.all_prs is False
+
+
+def test_parse_args_rejects_combination_of_all_prs_and_pr(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["ralph", "--all-prs", "--pr", "5"])
+    with pytest.raises(SystemExit):
+        cli._parse_args()
+    assert "--all-prs cannot be combined with --pr" in capsys.readouterr().err
+
+
+def test_parse_args_accepts_directory_after_pr_flag(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["ralph", "--pr", "12", "/tmp/some-dir"])
+    args = cli._parse_args()
+    assert args.pr == 12
+    assert args.directory == "/tmp/some-dir"
+
+
+def test_main_chdirs_into_directory_argument_before_resolving_pr(
+    cli_harness, cli_args, tmp_path
+):
+    target_dir = tmp_path / "target-repo"
+    target_dir.mkdir()
+    original_cwd = os.getcwd()
+    harness = cli_harness(args=cli_args(directory=str(target_dir)))
+    seen_cwds = []
+    real_pr_view = harness.pr_view
+
+    def record_cwd(*args, **kwargs):
+        seen_cwds.append(os.getcwd())
+        return real_pr_view.return_value
+
+    harness.pr_view.side_effect = record_cwd
+
+    assert cli.main() == 0
+    assert seen_cwds == [os.path.realpath(str(target_dir))]
+    assert os.getcwd() == original_cwd
+
+
+def test_main_rejects_nonexistent_directory_argument(cli_harness, cli_args, tmp_path):
+    missing = tmp_path / "does-not-exist"
+    cli_harness(args=cli_args(directory=str(missing)))
+
+    with pytest.raises(CommandError, match="Target directory does not exist"):
+        cli.main()
+
+
+def test_passthrough_args_strips_all_prs_flag():
+    argv = [
+        "/abs/path/script.py",
+        "--base",
+        "main",
+        "--all-prs",
+        "--max-review-rounds",
+        "3",
+        "/tmp/dir",
+    ]
+    out = cli._passthrough_args(argv)
+    assert "--all-prs" not in out
+    assert out == ["--base", "main", "--max-review-rounds", "3", "/tmp/dir"]
+
+
+def test_passthrough_args_preserves_argv_when_no_all_prs():
+    argv = ["script.py", "--pr", "7", "/tmp/dir"]
+    assert cli._passthrough_args(argv) == ["--pr", "7", "/tmp/dir"]
+
+
+def test_should_fan_out_implicitly_true_only_when_on_base_without_pr_or_flag(
+    monkeypatch, cli_args
+):
+    monkeypatch.setattr(cli, "_git_branch", lambda: "main")
+    assert cli._should_fan_out_implicitly(cli_args(pr=None, all_prs=False)) is True
+    assert cli._should_fan_out_implicitly(cli_args(pr=5, all_prs=False)) is False
+    assert cli._should_fan_out_implicitly(cli_args(pr=None, all_prs=True)) is False
+
+    monkeypatch.setattr(cli, "_git_branch", lambda: "feature")
+    assert cli._should_fan_out_implicitly(cli_args(pr=None, all_prs=False)) is False
+
+
+class _FakeProc:
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+        self.wait_called = False
+
+    def wait(self):
+        self.wait_called = True
+        return self.returncode
+
+
+def test_fan_out_all_prs_spawns_one_subprocess_per_pr_and_returns_zero(
+    monkeypatch, cli_args, tmp_path, capsys
+):
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [107, 105, 99])
+    spawned = []
+
+    def fake_popen(cmd, *a, **kw):
+        spawned.append(cmd)
+        return _FakeProc(0)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    script_path = str(tmp_path / "script.py")
+    (tmp_path / "script.py").write_text("# stub\n")
+
+    rc = cli._fan_out_all_prs(
+        cli_args(all_prs=True),
+        ["./script.py", "--all-prs", "--base", "main"],
+        script_path,
+    )
+
+    assert rc == 0
+    assert len(spawned) == 3
+    for cmd, expected_pr in zip(spawned, [107, 105, 99]):
+        assert cmd[0] == sys.executable
+        assert cmd[1] == script_path
+        assert "--all-prs" not in cmd
+        assert cmd[-2:] == ["--pr", str(expected_pr)]
+
+
+def test_fan_out_all_prs_returns_one_when_any_child_fails(
+    monkeypatch, cli_args, tmp_path
+):
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [10, 11])
+    codes = iter([0, 2])
+
+    def fake_popen(_cmd, *a, **kw):
+        return _FakeProc(next(codes))
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    script_path = str(tmp_path / "script.py")
+    (tmp_path / "script.py").write_text("# stub\n")
+
+    rc = cli._fan_out_all_prs(
+        cli_args(all_prs=True),
+        ["script.py", "--all-prs"],
+        script_path,
+    )
+
+    assert rc == 1
+
+
+def test_fan_out_all_prs_returns_zero_when_no_open_prs(
+    monkeypatch, cli_args, tmp_path
+):
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [])
+    monkeypatch.setattr(
+        cli.subprocess, "Popen", lambda *a, **k: pytest.fail("should not spawn")
+    )
+
+    rc = cli._fan_out_all_prs(
+        cli_args(all_prs=True),
+        ["script.py", "--all-prs"],
+        str(tmp_path / "script.py"),
+    )
+
+    assert rc == 0
+
+
+def test_main_with_all_prs_triggers_fan_out_and_skips_single_pr_path(
+    cli_harness, cli_args, monkeypatch, tmp_path
+):
+    target = tmp_path / "repo"
+    target.mkdir()
+    script_path = tmp_path / "ralph_script.py"
+    script_path.write_text("# stub\n")
+    monkeypatch.setattr(
+        sys, "argv", [str(script_path), "--all-prs", str(target)]
+    )
+    harness = cli_harness(args=cli_args(all_prs=True, directory=str(target)))
+    called = {"count": 0}
+
+    def fake_fan_out(args, argv, sp):
+        called["count"] += 1
+        return 0
+
+    monkeypatch.setattr(cli, "_fan_out_all_prs", fake_fan_out)
+
+    assert cli.main() == 0
+    assert called["count"] == 1
+    harness.pr_view.assert_not_called()
+    harness.acquire_lock.assert_not_called()
+
+
+def test_main_implicit_fan_out_when_on_base_branch_without_pr(
+    cli_harness, cli_args, monkeypatch, tmp_path
+):
+    target = tmp_path / "repo"
+    target.mkdir()
+    script_path = tmp_path / "ralph_script.py"
+    script_path.write_text("# stub\n")
+    monkeypatch.setattr(sys, "argv", [str(script_path), str(target)])
+    harness = cli_harness(
+        args=cli_args(pr=None, all_prs=False, directory=str(target))
+    )
+    harness.git_branch.return_value = "main"
+    called = {"count": 0}
+
+    def fake_fan_out(args, argv, sp):
+        called["count"] += 1
+        return 0
+
+    monkeypatch.setattr(cli, "_fan_out_all_prs", fake_fan_out)
+
+    assert cli.main() == 0
+    assert called["count"] == 1
+    harness.pr_view.assert_not_called()
+
+
+def test_main_no_implicit_fan_out_when_on_feature_branch(
+    cli_harness, cli_args, monkeypatch
+):
+    harness = cli_harness(args=cli_args(pr=None, all_prs=False))
+    harness.git_branch.return_value = "feature"
+    monkeypatch.setattr(
+        cli,
+        "_fan_out_all_prs",
+        lambda *a, **k: pytest.fail("should not fan out"),
+    )
+
+    assert cli.main() == 0
+    harness.pr_view.assert_called_once_with("feature")
 
 
 def test_compatibility_script_prints_command_error(monkeypatch, capsys):

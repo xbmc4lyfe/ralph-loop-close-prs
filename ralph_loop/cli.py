@@ -3,16 +3,24 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import signal
+import subprocess
 import sys
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .checks import _wait_for_required_checks_green
 from .codex_agent import _run_ci_fix_round, _run_review_fix_round
 from .config import DEFAULT_WORKTREE_ROOT
 from .errors import CommandError
-from .gh_ops import _mark_pr_needs_review, _merge_pr, _pr_view, _prepare_pr_for_merge
+from .gh_ops import (
+    _list_open_prs,
+    _mark_pr_needs_review,
+    _merge_pr,
+    _pr_view,
+    _prepare_pr_for_merge,
+)
 from .git_ops import (
     _git_branch,
     _git_head_sha,
@@ -140,6 +148,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--all-prs",
+        action="store_true",
+        help=(
+            "Fan out: discover all open non-draft PRs targeting --base in the "
+            "target directory and launch one ralph loop per PR in parallel "
+            "(passes through all other flags). Mutually exclusive with --pr."
+        ),
+    )
+    parser.add_argument(
         "directory",
         nargs="?",
         default=None,
@@ -148,7 +165,10 @@ def _parse_args() -> argparse.Namespace:
             "current working directory."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.all_prs and args.pr is not None:
+        parser.error("--all-prs cannot be combined with --pr")
+    return args
 
 
 def _resolve_pr_data(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
@@ -167,6 +187,13 @@ def _resolve_pr_data(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     if not isinstance(pr_number, int):
         raise CommandError("Could not resolve PR number for '{}'.".format(pr_ref))
     return pr_data, pr_number
+
+
+def _should_fan_out_implicitly(args: argparse.Namespace) -> bool:
+    if args.all_prs or args.pr is not None:
+        return False
+    current_branch = _git_branch()
+    return current_branch == args.base
 
 
 def _validate_pr_metadata(
@@ -221,8 +248,67 @@ def _run_dry_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _passthrough_args(argv: List[str]) -> List[str]:
+    """Return argv (minus argv[0]) with --all-prs removed for child fan-out."""
+    out: List[str] = []
+    skip_next = False
+    for token in argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--all-prs":
+            continue
+        out.append(token)
+    return out
+
+
+def _fan_out_all_prs(
+    args: argparse.Namespace, argv: List[str], script_path: str
+) -> int:
+    pr_numbers = _list_open_prs(args.base)
+    if not pr_numbers:
+        _print_step(
+            "No open non-draft PRs found targeting base '{}'.".format(args.base)
+        )
+        return 0
+    _print_step(
+        "Fan-out: launching ralph loops for {} open PR(s): {}".format(
+            len(pr_numbers), ", ".join("#" + str(n) for n in pr_numbers)
+        )
+    )
+    base_child_args = _passthrough_args(argv)
+    procs: List[Tuple[int, subprocess.Popen]] = []
+    for pr in pr_numbers:
+        cmd = [sys.executable, script_path] + base_child_args + ["--pr", str(pr)]
+        _print_step("Launching PR #{}: {}".format(pr, shlex.join(cmd)))
+        proc = subprocess.Popen(cmd)
+        procs.append((pr, proc))
+    failures: List[Tuple[int, int]] = []
+    for pr, proc in procs:
+        rc = proc.wait()
+        if rc != 0:
+            failures.append((pr, rc))
+            _print_step("PR #{} loop exited with code {}".format(pr, rc))
+        else:
+            _print_step("PR #{} loop completed successfully".format(pr))
+    if failures:
+        _print_step(
+            "{} of {} PR loops failed: {}".format(
+                len(failures),
+                len(pr_numbers),
+                ", ".join("#{}={}".format(pr, rc) for pr, rc in failures),
+            )
+        )
+        return 1
+    _print_step(
+        "All {} PR loops completed successfully".format(len(pr_numbers))
+    )
+    return 0
+
+
 def main() -> int:
     original_cwd = os.getcwd()
+    script_path = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
     args = _parse_args()
     if args.directory is not None:
         target_dir = os.path.abspath(os.path.expanduser(args.directory))
@@ -233,6 +319,27 @@ def main() -> int:
                 )
             )
         os.chdir(target_dir)
+    fan_out = args.all_prs or _should_fan_out_implicitly(args)
+    if fan_out:
+        if not args.all_prs:
+            _print_step(
+                "On base branch '{}' with no --pr; fanning out to all open PRs.".format(
+                    args.base
+                )
+            )
+        if not script_path or not os.path.isfile(script_path):
+            raise CommandError(
+                "Cannot resolve ralph script path for fan-out: {!r}".format(
+                    sys.argv[0] if sys.argv else ""
+                )
+            )
+        try:
+            return _fan_out_all_prs(args, sys.argv, script_path)
+        finally:
+            try:
+                os.chdir(original_cwd)
+            except OSError:
+                pass
     start_time = time.monotonic()
     deadline: Optional[float] = (
         start_time + args.max_wall_clock_seconds

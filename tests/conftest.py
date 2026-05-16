@@ -42,6 +42,7 @@ def make_args(**overrides):
         "worktree_root": "/tmp/ralph-worktrees",
         "max_wall_clock_seconds": 0,
         "directory": None,
+        "all_prs": False,
     }
     values.update(overrides)
     return argparse.Namespace(**values)

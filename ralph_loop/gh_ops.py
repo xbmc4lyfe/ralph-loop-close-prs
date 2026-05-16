@@ -291,6 +291,42 @@ def _prepare_pr_for_merge(pr_ref: str):
     )
 
 
+def _list_open_prs(base: str) -> list:
+    data = _gh_json(
+        [
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--base",
+            base,
+            "--limit",
+            "200",
+            "--json",
+            "number,isDraft,isCrossRepository",
+        ]
+    )
+    if not isinstance(data, list):
+        raise CommandError(
+            "Unexpected gh pr list response shape: expected list, got {}".format(
+                type(data).__name__
+            )
+        )
+    numbers = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        number = item.get("number")
+        if not isinstance(number, int):
+            continue
+        if item.get("isDraft"):
+            continue
+        if item.get("isCrossRepository"):
+            continue
+        numbers.append(number)
+    return numbers
+
+
 def _pr_view(pr_ref: str) -> dict:
     data = _gh_json(
         [

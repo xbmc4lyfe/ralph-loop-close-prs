@@ -431,6 +431,48 @@ def test_pr_view_requests_fork_metadata_and_requires_object_shape(monkeypatch, s
         gh_ops._pr_view("3")
 
 
+def test_list_open_prs_returns_numbers_filtering_drafts_and_forks(monkeypatch, spy):
+    gh_json = spy(
+        return_value=[
+            {"number": 107, "isDraft": False, "isCrossRepository": False},
+            {"number": 105, "isDraft": False, "isCrossRepository": False},
+            {"number": 94, "isDraft": False, "isCrossRepository": True},
+            {"number": 90, "isDraft": True, "isCrossRepository": False},
+        ]
+    )
+    monkeypatch.setattr(gh_ops, "_gh_json", gh_json)
+
+    assert gh_ops._list_open_prs("main") == [107, 105]
+    call_args = gh_json.call_args.args[0]
+    assert "--state" in call_args and "open" in call_args
+    assert "--base" in call_args and "main" in call_args
+
+
+def test_list_open_prs_returns_empty_list_when_no_prs(monkeypatch):
+    monkeypatch.setattr(gh_ops, "_gh_json", lambda _args: [])
+    assert gh_ops._list_open_prs("main") == []
+
+
+def test_list_open_prs_skips_items_missing_or_non_int_number(monkeypatch):
+    monkeypatch.setattr(
+        gh_ops,
+        "_gh_json",
+        lambda _args: [
+            {"isDraft": False, "isCrossRepository": False},
+            {"number": "12", "isDraft": False, "isCrossRepository": False},
+            {"number": 50, "isDraft": False, "isCrossRepository": False},
+            "not a dict",
+        ],
+    )
+    assert gh_ops._list_open_prs("main") == [50]
+
+
+def test_list_open_prs_rejects_non_list_shape(monkeypatch):
+    monkeypatch.setattr(gh_ops, "_gh_json", lambda _args: {"number": 12})
+    with pytest.raises(CommandError, match="expected list"):
+        gh_ops._list_open_prs("main")
+
+
 def test_required_checks_falls_back_to_optional_checks(monkeypatch, spy):
     pr_checks = spy(side_effect=[[], [{"name": "unit", "bucket": "pass"}]])
     monkeypatch.setattr(gh_ops, "_pr_checks", pr_checks)

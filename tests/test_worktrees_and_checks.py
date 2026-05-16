@@ -159,6 +159,42 @@ def test_ensure_pr_worktree_refuses_other_branch_worktree(
     assert "found another ralph loop" in capsys.readouterr().out
 
 
+def test_ensure_pr_worktree_operates_in_place_when_branch_is_checked_out_at_cwd(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "primary-checkout"
+    target.mkdir()
+    monkeypatch.chdir(target)
+    monkeypatch.setattr(
+        worktrees, "_fetch_pr_branch_or_head", lambda **_kwargs: "origin/feature"
+    )
+    monkeypatch.setattr(
+        worktrees, "_worktree_for_branch", lambda _branch: str(target)
+    )
+    origin_calls = []
+    sync_calls = []
+    monkeypatch.setattr(
+        worktrees,
+        "_ensure_worktree_origin_matches",
+        lambda path: origin_calls.append(path),
+    )
+    monkeypatch.setattr(
+        worktrees,
+        "_sync_existing_worktree",
+        lambda **kwargs: sync_calls.append(kwargs),
+    )
+
+    result = worktrees._ensure_pr_worktree(
+        worktree_root=str(tmp_path / "worktrees"),
+        pr_number=9,
+        branch="feature",
+    )
+
+    assert result == os.path.abspath(str(target))
+    assert origin_calls == [os.path.abspath(str(target))]
+    assert sync_calls and sync_calls[0]["path"] == os.path.abspath(str(target))
+
+
 def test_ensure_pr_worktree_reuses_matching_path_and_rejects_wrong_branch(
     monkeypatch, tmp_path, completed_process
 ):
