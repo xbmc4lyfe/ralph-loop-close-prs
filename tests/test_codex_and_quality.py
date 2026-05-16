@@ -1,3 +1,5 @@
+import builtins
+
 import pytest
 
 from ralph_loop import codex_agent, quality
@@ -181,6 +183,80 @@ def test_codex_exec_reads_last_message_with_size_bound(
     assert marker is None
     assert "truncated" in message
     assert len(message) < 80
+
+
+def test_codex_exec_does_not_read_unbounded_last_message(
+    monkeypatch, completed_process
+):
+    real_open = builtins.open
+
+    class GuardedReader:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._handle.__exit__(exc_type, exc, tb)
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                raise AssertionError("last-message read must be bounded")
+            return self._handle.read(size)
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+    output_path_holder = {}
+
+    def fake_run(cmd, check, capture_output, **_kwargs):
+        output_path = cmd[cmd.index("-o") + 1]
+        output_path_holder["path"] = output_path
+        with real_open(output_path, "w", encoding="utf-8") as handle:
+            handle.write("REVIEW_PASS=yes\n{}".format("A" * 100))
+        return completed_process()
+
+    def guarded_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if path == output_path_holder.get("path") and "r" in (args[0] if args else kwargs.get("mode", "r")):
+            return GuardedReader(handle)
+        return handle
+
+    monkeypatch.setattr(codex_agent, "CODEX_LAST_MESSAGE_LIMIT", 30)
+    monkeypatch.setattr(codex_agent, "_run_command", fake_run)
+    monkeypatch.setattr(builtins, "open", guarded_open)
+
+    _marker, message = codex_agent._codex_exec_with_marker(
+        prompt="prompt",
+        marker_regex=r"REVIEW_PASS=(yes|no)",
+        model=None,
+    )
+
+    assert "truncated" in message
+
+
+def test_codex_exec_bounded_last_message_preserves_trailing_marker(
+    monkeypatch, completed_process
+):
+    def fake_run(cmd, check, capture_output, **_kwargs):
+        output_path = cmd[cmd.index("-o") + 1]
+        with open(output_path, "w", encoding="utf-8") as handle:
+            handle.write("{}\nREVIEW_PASS=yes\n".format("A" * 100))
+        return completed_process()
+
+    monkeypatch.setattr(codex_agent, "CODEX_LAST_MESSAGE_LIMIT", 40)
+    monkeypatch.setattr(codex_agent, "_run_command", fake_run)
+
+    marker, message = codex_agent._codex_exec_with_marker(
+        prompt="prompt",
+        marker_regex=r"REVIEW_PASS=(yes|no)",
+        model=None,
+    )
+
+    assert marker is True
+    assert "truncated" in message
 
 
 def test_codex_exec_raises_when_failed_run_has_no_last_message(
@@ -494,18 +570,26 @@ def test_local_quality_gates_run_ci_then_test_and_report_first_failure(
         ["just", "ci"],
         ["just", "test"],
     ]
+    assert [call.kwargs["replay_output"] for call in run.call_args_list] == [
+        False,
+        False,
+    ]
 
-    monkeypatch.setattr(
-        quality,
-        "_run_command",
-        lambda *_args, **_kwargs: completed_process(
+    failing_run = spy(
+        return_value=completed_process(
             returncode=1,
             stdout="Authorization: Bearer super-secret-token\nbad\n",
         ),
     )
+    monkeypatch.setattr(
+        quality,
+        "_run_command",
+        failing_run,
+    )
     ok, summary = quality._run_local_quality_gates()
 
     assert ok is False
+    assert failing_run.call_args.kwargs["replay_output"] is False
     assert "Command `just ci` failed" in summary
     assert "bad" in summary
     assert "super-secret-token" not in summary

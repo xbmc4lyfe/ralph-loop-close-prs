@@ -96,7 +96,10 @@ The worktree path format is:
 The script:
 
 - reuses the expected dedicated worktree path if it already exists
-- exits cleanly if the PR branch is checked out in any other worktree
+- aborts any interrupted rebase in a reused PR worktree before syncing it to the
+  fetched PR head
+- exits with the loop-already-running code if the PR branch is checked out in
+  any other worktree, so fan-out supervisors back off instead of tight-looping
 - acquires a persistent per-PR advisory lock at `/tmp/codex-ralph-loop-pr-<pr-number>.lock`
 - changes into the PR worktree before doing repair work
 
@@ -114,9 +117,10 @@ are interrupted when the remaining wall-clock budget expires.
 If generated changes are considered not useful, it resets the worktree with:
 
 - `git reset --hard HEAD`
-- `git clean -fd`
+- `git clean -fdx`
 
-That behavior is destructive inside the PR worktree.
+That behavior is destructive inside the PR worktree and also removes ignored
+generated files there.
 
 ## GitHub Check Waiting
 
@@ -174,6 +178,8 @@ python3 codex_ralph_wiggum_loop.py --pr 123 --base main --skip-merge
 - The only generated artifact currently seen in the repo is `__pycache__/`.
 - Captured subprocess stdout/stderr are bounded and truncated before being
   returned or replayed to logs.
+- `codex exec` prompts are sent on stdin and redacted in command logs, so they
+  are not printed as giant argv lines.
 
 ## Small TODO
 

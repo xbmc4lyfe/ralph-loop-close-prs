@@ -322,6 +322,8 @@ def _list_open_prs(base: str) -> list:
             continue
         if item.get("isDraft"):
             continue
+        if item.get("isCrossRepository"):
+            continue
         numbers.append(number)
     return numbers
 
@@ -429,8 +431,8 @@ def _pr_is_still_open(pr_number: int) -> bool:
 
     Behaviour:
       - Returns True for OPEN, non-draft PRs.
-      - Returns False for any definitive non-OPEN state (MERGED, CLOSED) or
-        when the PR is in draft state.
+      - Returns False for any definitive non-OPEN state (MERGED, CLOSED), when
+        the PR is in draft state, or when it is from a fork.
       - Raises CommandError for transient/network failures so the caller can
         decide whether to keep the PR in the respawn set. We err on the side
         of returning False only when GitHub explicitly tells us the PR is no
@@ -448,6 +450,8 @@ def _pr_is_still_open(pr_number: int) -> bool:
     if state.upper() != "OPEN":
         return False
     if pr_data.get("isDraft"):
+        return False
+    if pr_data.get("isCrossRepository"):
         return False
     return True
 

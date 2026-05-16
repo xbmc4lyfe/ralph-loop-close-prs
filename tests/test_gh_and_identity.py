@@ -432,7 +432,7 @@ def test_pr_view_requests_fork_metadata_and_requires_object_shape(monkeypatch, s
         gh_ops._pr_view("3")
 
 
-def test_list_open_prs_returns_numbers_filtering_drafts_only(monkeypatch, spy):
+def test_list_open_prs_returns_numbers_filtering_drafts_and_forks(monkeypatch, spy):
     gh_json = spy(
         return_value=[
             {"number": 107, "isDraft": False, "isCrossRepository": False},
@@ -443,7 +443,7 @@ def test_list_open_prs_returns_numbers_filtering_drafts_only(monkeypatch, spy):
     )
     monkeypatch.setattr(gh_ops, "_gh_json", gh_json)
 
-    assert gh_ops._list_open_prs("main") == [107, 105, 94]
+    assert gh_ops._list_open_prs("main") == [107, 105]
     call_args = gh_json.call_args.args[0]
     assert "--state" in call_args and "open" in call_args
     assert "--base" in call_args and "main" in call_args
@@ -514,6 +514,21 @@ def test_pr_is_still_open_returns_false_for_draft_open_pr(monkeypatch):
     )
 
     assert gh_ops._pr_is_still_open(9) is False
+
+
+def test_pr_is_still_open_returns_false_for_fork_open_pr(monkeypatch):
+    monkeypatch.setattr(
+        gh_ops,
+        "_pr_view",
+        lambda _ref: {
+            "state": "OPEN",
+            "isDraft": False,
+            "isCrossRepository": True,
+            "number": 94,
+        },
+    )
+
+    assert gh_ops._pr_is_still_open(94) is False
 
 
 def test_pr_is_still_open_raises_on_transient_view_failure(monkeypatch):

@@ -58,6 +58,32 @@ def _detect_codex_env_failure(*texts: str) -> Optional[str]:
     return None
 
 
+def _read_last_message_bounded(path: str) -> str:
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        if size <= CODEX_LAST_MESSAGE_LIMIT:
+            handle.seek(0)
+            return handle.read(CODEX_LAST_MESSAGE_LIMIT).decode(
+                "utf-8", errors="replace"
+            ).strip()
+
+        head_size = max(0, CODEX_LAST_MESSAGE_LIMIT // 2)
+        tail_size = max(0, CODEX_LAST_MESSAGE_LIMIT - head_size)
+        handle.seek(0)
+        head = handle.read(head_size)
+        tail = b""
+        if tail_size > 0:
+            handle.seek(size - tail_size)
+            tail = handle.read(tail_size)
+        omitted = size - CODEX_LAST_MESSAGE_LIMIT
+        return "{}...<truncated {} bytes>...{}".format(
+            head.decode("utf-8", errors="replace"),
+            omitted,
+            tail.decode("utf-8", errors="replace"),
+        ).strip()
+
+
 def _extract_yes_no_marker(*, marker_regex: str, text: str) -> Optional[bool]:
     """Return the yes/no marker value, scanning ``text`` bottom-up.
 
@@ -112,11 +138,7 @@ def _codex_exec_with_marker(
             log_cmd=log_cmd,
         )
         try:
-            with open(temp_path, "r", encoding="utf-8") as handle:
-                last_message = _truncate_for_log(
-                    handle.read().strip(),
-                    CODEX_LAST_MESSAGE_LIMIT,
-                )
+            last_message = _read_last_message_bounded(temp_path)
         except FileNotFoundError:
             last_message = ""
     if completed.returncode != 0:

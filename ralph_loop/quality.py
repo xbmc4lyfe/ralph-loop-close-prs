@@ -101,7 +101,12 @@ def _staged_changes_exist() -> bool:
 def _run_local_quality_gates() -> Tuple[bool, str]:
     _print_step("Running local quality gates before commit/push (just ci + just test)")
     for recipe in ("ci", "test"):
-        result = _run_command(["just", recipe], check=False, capture_output=True)
+        result = _run_command(
+            ["just", recipe],
+            check=False,
+            capture_output=True,
+            replay_output=False,
+        )
         if result.returncode != 0:
             output = _completed_process_output(result) or "<no output>"
             failure_summary = "Command `just {}` failed with exit code {}.\n{}".format(

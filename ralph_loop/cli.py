@@ -280,10 +280,10 @@ def _validate_pr_metadata(
             "PR is in draft state; mark it ready before merge automation."
         )
     if pr_data.get("isCrossRepository"):
-        _print_step(
-            "PR #{} is from a fork; review fixes that need pushing will fail "
-            "for this PR but ralph will still try to merge it if review and "
-            "CI are already green.".format(pr_number)
+        raise CommandError(
+            "PR #{} is from a fork / cross-repository branch; Ralph requires a "
+            "same-repository PR because it rebases and pushes fixes to the head "
+            "branch.".format(pr_number)
         )
     pr_base = pr_data.get("baseRefName")
     if pr_base and pr_base != expected_base:

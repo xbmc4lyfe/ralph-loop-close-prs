@@ -128,7 +128,11 @@ Before it starts changing anything, the script acquires a lock with `_acquire_lo
 
 That lock is keyed by PR number and prevents concurrent loop runs for the same PR. The lock file is persistent and the advisory lock is released in `finally`, so normal failures still unwind cleanly without creating an unlink race.
 
-There is also a secondary concurrency guard during branch checkout/worktree creation. If git reports that the branch is already in use by another worktree, the script prints the loop-already-running message and exits successfully instead of fighting over the branch.
+There is also a secondary concurrency guard during branch checkout/worktree
+creation. If git reports that the branch is already in use by another worktree,
+the script prints the loop-already-running message and exits with a dedicated
+loop-owned status code. Fan-out supervisors treat that code like a long-backoff
+condition instead of respawning the same PR immediately.
 
 ## Worktree management
 
@@ -151,8 +155,11 @@ The worktree flow is:
 1. Determine the desired worktree path.
 2. Fetch the PR branch or PR head ref with `_fetch_pr_branch_or_head(...)`.
 3. If the branch is already checked out at a different worktree path, exit cleanly instead of running destructive cleanup outside the dedicated path.
-4. If the target path already exists, verify it is on the expected branch and reuse it.
-5. Otherwise create the worktree with `git worktree add ... -B <branch> <start-ref>`.
+4. If the target path already exists, verify it is registered for the launching
+   repo, verify its `origin` remote, restore the expected branch if needed, abort
+   any interrupted rebase, and sync it to the fetched PR head only if doing so
+   does not drop local commits.
+5. Otherwise create the worktree without resetting an existing local branch.
 
 After the worktree is ready, `main()` calls `os.chdir(worktree)` and all later git operations happen there.
 
@@ -162,7 +169,7 @@ The script then runs `_ensure_runtime_identity()` again so the worktree-local gi
 
 Once inside the PR worktree, the script checks `_working_tree_dirty()`.
 
-If the worktree is dirty, the run aborts immediately. The script requires a clean starting point because later recovery paths can use hard resets and `git clean -fd`.
+If the worktree is dirty, the run aborts immediately. The script requires a clean starting point because later recovery paths can use hard resets and `git clean -fdx`.
 
 That is an important operational constraint: the dedicated worktree is treated as disposable automation state, not as a place for manual edits.
 
@@ -189,6 +196,10 @@ That helper:
 3. Writes Codex's final response to a temp file via `-o`.
 4. Reads the file back.
 5. Extracts a yes/no marker from the final message with `_extract_yes_no_marker(...)`.
+
+The prompt is passed to Codex on stdin, and command logging replaces the stdin
+marker with `<codex prompt on stdin>` so review comments, failure summaries, and
+private URLs are not printed into Ralph logs as one giant command line.
 
 If `codex exec` exits non-zero, the helper raises `CommandError` before marker
 extraction. A captured last-message may be included in the error for
@@ -306,7 +317,10 @@ remaining run budget expires.
 The discard path uses `_reset_generated_changes(...)`, which can run:
 
 - `git reset --hard <target>`
-- `git clean -fd`
+- `git clean -fdx`
+
+That cleanup removes ignored generated files as well as ordinary untracked files
+inside the dedicated PR worktree.
 
 This is destructive inside the PR worktree. It is designed to throw away automation-generated changes that are not worth keeping.
 
@@ -314,7 +328,8 @@ This is destructive inside the PR worktree. It is designed to throw away automat
 
 When the working tree is dirty after all gates pass, the script commits with:
 
-- `git add -A`
+- `git add -u`
+- `git add -- <non-generated untracked paths>`
 - `git commit --signoff -S -m "fix: codex loop <iteration label>" -m <coauthor line>`
 
 If the working tree is clean but new commits already exist, it skips creating another commit and just pushes.
@@ -436,7 +451,10 @@ Examples include:
 
 At the process boundary, `__main__` catches `CommandError`, prints `ERROR: ...` to stderr, and exits with status `1`.
 
-Some concurrency-style early exits use `SystemExit(0)` instead, specifically when the target branch is already in use by another worktree and the script decides another loop instance is already active.
+Codex environment failures use a dedicated exit code so fan-out supervisors can
+use a longer respawn backoff. Concurrency-style early exits for PRs already
+owned by another Ralph loop also use a dedicated status code for the same
+long-backoff behavior.
 
 ## Filesystem and state side effects
 
@@ -463,7 +481,8 @@ A few current characteristics matter when running it:
 - `os.chdir(worktree)` is process-global and remains in effect for later helpers
 - `codex exec` failures are fatal even when a partial last-message exists
 - many loops are unbounded by default unless you set explicit caps
-- transient GitHub CLI failures are not retried automatically
+- known transient GitHub CLI failures are retried automatically before surfacing
+  as operational errors
 
 Those are not hidden behaviors. They are part of the current design.
 

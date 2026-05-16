@@ -173,6 +173,30 @@ def test_main_rejects_numeric_current_branch_without_explicit_pr(
     harness.pr_view.assert_not_called()
 
 
+def test_main_rejects_fork_pr_before_mutating_state(cli_harness, cli_args):
+    harness = cli_harness(
+        args=cli_args(pr=94),
+        pr_data={
+            "number": 94,
+            "url": "https://example.test/pr/94",
+            "state": "OPEN",
+            "isDraft": False,
+            "isCrossRepository": True,
+            "baseRefName": "main",
+            "headRefName": "feat/full-test-stack",
+        },
+    )
+
+    with pytest.raises(CommandError, match="fork"):
+        cli.main()
+
+    harness.ensure_identity.assert_not_called()
+    harness.acquire_lock.assert_not_called()
+    harness.ensure_worktree.assert_not_called()
+    harness.mark_review.assert_not_called()
+    harness.rebase.assert_not_called()
+
+
 def test_main_dry_run_validates_pr_without_mutating_local_or_remote_state(
     cli_harness, cli_args, capsys
 ):
