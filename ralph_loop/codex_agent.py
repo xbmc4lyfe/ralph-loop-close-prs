@@ -45,16 +45,25 @@ def _detect_codex_env_failure(*texts: str) -> Optional[str]:
 
 
 def _extract_yes_no_marker(*, marker_regex: str, text: str) -> Optional[bool]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) != 1:
+    """Return the yes/no marker value, scanning ``text`` bottom-up.
+
+    Codex frequently emits its chain-of-thought before the final answer, and
+    that narrative may contain intermediate ``MARKER=yes`` / ``MARKER=no``
+    lines. We treat the LAST stripped line that fullmatches ``marker_regex``
+    as the authoritative answer. Returns ``None`` if no line matches.
+    """
+    for raw_line in reversed(text.splitlines()):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        match = re.fullmatch(marker_regex, stripped, flags=re.IGNORECASE)
+        if not match:
+            continue
+        values = match.groups() or (match.group(0),)
+        for value in reversed(values):
+            if isinstance(value, str) and value.lower() in ("yes", "no"):
+                return value.lower() == "yes"
         return None
-    match = re.fullmatch(marker_regex, lines[0], flags=re.IGNORECASE)
-    if not match:
-        return None
-    values = match.groups() or (match.group(0),)
-    for value in reversed(values):
-        if isinstance(value, str) and value.lower() in ("yes", "no"):
-            return value.lower() == "yes"
     return None
 
 

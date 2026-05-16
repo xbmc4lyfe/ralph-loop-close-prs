@@ -4,7 +4,7 @@ from ralph_loop import codex_agent, quality
 from ralph_loop.errors import CodexEnvironmentError, CommandError
 
 
-def test_extract_marker_requires_one_exact_marker_line_and_handles_missing_values():
+def test_extract_marker_picks_last_matching_line_and_handles_missing_values():
     assert (
         codex_agent._extract_yes_no_marker(
             marker_regex=r"REVIEW_PASS=(yes|no)",
@@ -12,13 +12,22 @@ def test_extract_marker_requires_one_exact_marker_line_and_handles_missing_value
         )
         is True
     )
+    # Chain-of-thought may emit intermediate markers; the last marker wins.
     assert (
         codex_agent._extract_yes_no_marker(
             marker_regex=r"REVIEW_PASS=(yes|no)",
             text="REVIEW_PASS=no\nlater\nREVIEW_PASS=yes",
         )
-        is None
+        is True
     )
+    assert (
+        codex_agent._extract_yes_no_marker(
+            marker_regex=r"REVIEW_PASS=(yes|no)",
+            text="REVIEW_PASS=yes\nthinking some more\nREVIEW_PASS=no",
+        )
+        is False
+    )
+    # Marker embedded inside a longer narrative line still doesn't fullmatch.
     assert (
         codex_agent._extract_yes_no_marker(
             marker_regex=r"REVIEW_PASS=(yes|no)",
@@ -45,6 +54,62 @@ def test_extract_marker_requires_one_exact_marker_line_and_handles_missing_value
         )
         is False
     )
+    # Surrounding whitespace / blank lines around the trailing marker are OK.
+    assert (
+        codex_agent._extract_yes_no_marker(
+            marker_regex=r"REVIEW_PASS=(yes|no)",
+            text="some narrative\n\n   REVIEW_PASS=yes   \n",
+        )
+        is True
+    )
+
+
+def test_extract_marker_ignores_chain_of_thought_above_final_marker():
+    # Simulates a real codex transcript: bulleted reasoning, embedded markers
+    # inside prose, then a clean final answer on the last non-empty line.
+    narrative = (
+        "I will run /review.\n"
+        "- Iteration 1: REVIEW_PASS=no because lint failed\n"
+        "- After fix, /review returns no findings, so REVIEW_PASS=yes here is tentative\n"
+        "- One more pass to be sure\n"
+        "Final answer:\n"
+        "\n"
+        "REVIEW_PASS=yes\n"
+    )
+    assert (
+        codex_agent._extract_yes_no_marker(
+            marker_regex=r"REVIEW_PASS=(yes|no)", text=narrative
+        )
+        is True
+    )
+
+
+def test_parse_addressed_comments_extracts_blocks_from_chain_of_thought_narrative():
+    text = (
+        "Thinking step by step.\n"
+        "I see a comment that I should fix; let me note ADDRESSED_COMMENT=999: "
+        "preliminary thought (this is in prose, not on its own line).\n"
+        "Now the real outputs:\n"
+        "\n"
+        "ADDRESSED_COMMENT_START=12345\n"
+        "Wrapped redaction around the api key logger.\n"
+        "Files: foo.py\n"
+        "ADDRESSED_COMMENT_END\n"
+        "ADDRESSED_COMMENT=67890: Match by preset_id when id is empty.\n"
+        "REVIEW_PASS=yes\n"
+    )
+    addressed = codex_agent._parse_addressed_comments(text)
+    # The inline prose mention of ADDRESSED_COMMENT=999 is buried mid-line
+    # ("...let me note ADDRESSED_COMMENT=999: ..."), and the parser uses
+    # re.match on a stripped line so it is anchored at the line start --
+    # narrative noise is correctly ignored.
+    ids = [cid for cid, _ in addressed]
+    assert 999 not in ids
+    assert 12345 in ids
+    assert 67890 in ids
+    summary_by_id = dict(addressed)
+    assert "redaction" in summary_by_id[12345].lower()
+    assert summary_by_id[67890] == "Match by preset_id when id is empty."
 
 
 @pytest.mark.parametrize(
