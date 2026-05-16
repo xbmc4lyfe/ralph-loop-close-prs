@@ -8,16 +8,6 @@ historical findings are omitted from this active list.
 
 No currently verified high-severity findings remain in this active tracker.
 
-## MEDIUM
-
-### M11. Required-check polling can go green on optional checks before required checks appear - `ralph_loop/gh_ops.py`, `ralph_loop/checks.py`
-
-`_required_checks()` still falls back to all checks whenever
-`gh pr checks --required` reports no required checks. `_wait_for_required_checks_green()`
-can then return success if those fallback checks are only `pass` or `skipping`.
-A fresh commit can therefore advance toward approval or merge when optional
-checks have reported success but required checks have not appeared yet.
-
 ## LOW / DEFERRED
 
 ### L5. `_round_numbers` remains a very thin helper - `ralph_loop/runtime.py`

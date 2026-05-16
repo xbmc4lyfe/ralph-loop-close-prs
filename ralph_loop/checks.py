@@ -97,6 +97,22 @@ def _wait_for_required_checks_green(
         _print_step("{} check buckets: {}".format(scope, summary))
         buckets = {check.get("bucket") for check in checks}
         if buckets.issubset({"pass", "skipping"}):
+            if not were_required:
+                elapsed = time.monotonic() - started
+                if elapsed >= no_checks_grace_seconds:
+                    _print_step(
+                        "No required checks reported after {}s grace; accepting "
+                        "fallback checks.".format(no_checks_grace_seconds)
+                    )
+                    return True, checks
+                _print_step(
+                    "No required checks reported yet; fallback checks are "
+                    "green, waiting (grace {}s).".format(
+                        no_checks_grace_seconds
+                    )
+                )
+                sleep_for_next_poll()
+                continue
             return True, checks
         if "pending" not in buckets:
             return False, checks

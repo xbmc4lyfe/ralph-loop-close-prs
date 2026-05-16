@@ -129,6 +129,11 @@ green. Empty check results and `gh pr checks` exit code 8 are treated as pending
 state, not success. If checks never appear or never leave pending state before
 `--checks-timeout-seconds`, the run stops with an error.
 
+If GitHub reports no required checks but optional checks are already green,
+Ralph keeps polling through the no-checks grace window before accepting the
+optional-check fallback. This prevents a fresh commit from advancing before
+required checks have had time to appear.
+
 ## Merge Behavior
 
 If merge is enabled, the script will:

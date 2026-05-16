@@ -363,7 +363,8 @@ For each poll cycle, it summarizes the current check buckets, such as:
 The result rules are:
 
 - if no checks are reported yet, keep polling until checks appear or the timeout expires
-- if all reported buckets are `pass` or `skipping`, treat the branch as green
+- if required checks are reported and all buckets are `pass` or `skipping`, treat the branch as green
+- if only fallback optional checks are reported and all buckets are `pass` or `skipping`, keep polling through the no-checks grace window before accepting the fallback as green
 - if any check is still `pending`, keep polling
 - if checks are failing and none are pending, return failure to the CI loop
 - if polling exceeds the timeout, raise `CommandError`
