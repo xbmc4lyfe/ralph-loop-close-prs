@@ -708,6 +708,28 @@ def test_validate_identity_and_signing_accepts_inline_public_key(monkeypatch):
     identity._validate_identity_and_signing()
 
 
+def test_validate_identity_and_signing_rejects_unexpected_coauthor_email(
+    monkeypatch,
+):
+    values = {
+        "user.name": identity.GIT_NAME,
+        "user.email": identity.GIT_EMAIL,
+        "user.signingkey": "ssh-ed25519 AAA",
+        "commit.gpgsign": "true",
+    }
+    monkeypatch.setattr(identity, "_active_gh_user", lambda: identity.GH_USER)
+    monkeypatch.setattr(identity, "_git_config_get", lambda key: values[key])
+    monkeypatch.setattr(
+        identity,
+        "COAUTHOR_LINE",
+        "Co-Authored-By: Surprise <surprise@example.com>",
+        raising=False,
+    )
+
+    with pytest.raises(CommandError, match="Co-author email"):
+        identity._validate_identity_and_signing()
+
+
 def test_validate_identity_and_signing_reports_each_mismatch(monkeypatch):
     monkeypatch.setattr(identity, "_active_gh_user", lambda: "other")
     with pytest.raises(CommandError, match="Active gh user"):

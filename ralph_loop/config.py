@@ -66,6 +66,13 @@ COAUTHOR_LINE = os.environ.get(
 )
 
 
+COAUTHOR_ALLOWED_EMAILS = tuple(
+    email.strip().lower()
+    for email in os.environ.get("RALPH_COAUTHOR_ALLOWED_EMAILS", "").split(",")
+    if email.strip()
+)
+
+
 NEEDS_REVIEW_LABEL = "needs review"
 
 

@@ -22,5 +22,3 @@ it.
   behavior around git/GitHub side effects.
 - No structured JSON-lines logging option.
 - No telemetry for round counts, phase duration, or total wall-clock time.
-- `COAUTHOR_LINE` is env-overridable, but there is still no validation that the
-  configured email matches the active signer or intended attribution.

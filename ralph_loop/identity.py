@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import time
 
 from .config import (
+    COAUTHOR_ALLOWED_EMAILS,
+    COAUTHOR_LINE,
     GH_USER,
     GIT_EMAIL,
     GIT_NAME,
@@ -21,6 +24,8 @@ from .process import _print_step, _run_command
 
 _GIT_CONFIG_LOCK_RETRIES = 12
 _GIT_CONFIG_LOCK_BASE_DELAY = 0.05
+_COAUTHOR_EMAIL_RE = re.compile(r"^Co-Authored-By:\s+[^<>\n]+\s+<([^<>\s]+)>$")
+_DEFAULT_ALLOWED_COAUTHOR_EMAILS = frozenset(("oz-agent@warp.dev",))
 
 
 def _set_git_config_if_changed(key: str, value: str) -> None:
@@ -58,6 +63,28 @@ def _is_truthy(value: str) -> bool:
 def _looks_like_ssh_public_key(text: str) -> bool:
     head = text.strip().split()
     return bool(head) and head[0].startswith(("ssh-", "ecdsa-", "sk-ssh-", "sk-ecdsa-"))
+
+
+def _coauthor_email(line: str) -> str:
+    match = _COAUTHOR_EMAIL_RE.match(line.strip())
+    if not match:
+        raise CommandError(
+            "RALPH_COAUTHOR_LINE must be a single Co-Authored-By trailer."
+        )
+    return match.group(1).lower()
+
+
+def _validate_coauthor_line(git_email: str) -> None:
+    coauthor_email = _coauthor_email(COAUTHOR_LINE)
+    allowed = set(_DEFAULT_ALLOWED_COAUTHOR_EMAILS)
+    allowed.add(git_email.lower())
+    allowed.update(COAUTHOR_ALLOWED_EMAILS)
+    if coauthor_email not in allowed:
+        raise CommandError(
+            "Co-author email '{}' is not allowed for Ralph commits; expected "
+            "the active git email or a configured RALPH_COAUTHOR_ALLOWED_EMAILS "
+            "entry.".format(coauthor_email)
+        )
 
 
 def _validate_identity_and_signing():
@@ -103,6 +130,7 @@ def _validate_identity_and_signing():
         raise CommandError(
             "git commit.gpgsign must be enabled to ensure signed commits."
         )
+    _validate_coauthor_line(git_email)
 
 
 def _ensure_runtime_identity():
