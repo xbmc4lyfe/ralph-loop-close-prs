@@ -237,6 +237,10 @@ def test_codex_exec_raises_when_failed_run_has_partial_last_message(
         "codex exec failed (exit=1) with no partial last-message captured.",
         "/bin/zsh:1: no such file or directory: /review",
         "exec: /bin/bash -lc /review exited 127",
+        "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at May 16th, 2026 2:30 AM.",
+        "ERROR: unexpected status 401 Unauthorized: {\"error\":\"invalid api key\"}",
+        "ERROR: exceeded retry limit, last status: 429 Too Many Requests",
+        "failed to connect to websocket: HTTP error: 502 Bad Gateway",
     ],
 )
 def test_detect_codex_env_failure_matches_known_patterns(text):

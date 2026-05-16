@@ -21,6 +21,10 @@ CODEX_LAST_MESSAGE_LIMIT = 4000
 _CODEX_ENV_FAILURE_PATTERNS = (
     re.compile(r"\b401\s+Unauthorized\b", re.IGNORECASE),
     re.compile(r"Missing bearer or basic authentication", re.IGNORECASE),
+    re.compile(r"\busage limit\b|\bpurchase more credits\b", re.IGNORECASE),
+    re.compile(r"\binvalid api key\b", re.IGNORECASE),
+    re.compile(r"exceeded retry limit.*\b429\b", re.IGNORECASE),
+    re.compile(r"websocket.*HTTP error:\s*5\d\d", re.IGNORECASE),
     re.compile(r"Reconnecting\.\.\.\s*5\s*/\s*5", re.IGNORECASE),
     re.compile(
         r"codex exec failed.*no partial last-message", re.IGNORECASE | re.DOTALL
