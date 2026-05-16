@@ -91,9 +91,43 @@ def _reset_generated_changes(target_sha: Optional[str] = None):
     _run_command(["git", "clean", "-fdx"], check=True, capture_output=True)
 
 
+_FETCH_TRANSIENT_PATTERNS = (
+    "unable to update local ref",
+    "cannot lock ref",
+    "could not lock config file",
+    "ref-pack",
+    "fatal: unable to access",
+    "fatal: early eof",
+)
+
+_FETCH_MAX_ATTEMPTS = 6
+
+
+def _fetch_with_retry(remote: str, ref: str):
+    import random as _random
+    import time as _time
+
+    last_exc: Optional[CommandError] = None
+    for attempt in range(_FETCH_MAX_ATTEMPTS):
+        try:
+            _run_command(
+                ["git", "fetch", remote, ref], check=True, capture_output=True
+            )
+            return
+        except CommandError as exc:
+            text = str(exc).lower()
+            if not any(p in text for p in _FETCH_TRANSIENT_PATTERNS):
+                raise
+            last_exc = exc
+            delay = 0.5 * (2 ** attempt)
+            _time.sleep(delay + _random.uniform(0, delay))
+    assert last_exc is not None
+    raise last_exc
+
+
 def _rebase_onto_base(branch: str, base: str):
     _print_step("Rebasing {} onto origin/{}".format(branch, base))
-    _run_command(["git", "fetch", "origin", base], check=True, capture_output=True)
+    _fetch_with_retry("origin", base)
     _run_command(
         ["git", "rebase", "origin/{}".format(base)], check=True, capture_output=True
     )

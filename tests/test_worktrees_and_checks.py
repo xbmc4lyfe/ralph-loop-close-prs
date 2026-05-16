@@ -224,12 +224,40 @@ def test_ensure_pr_worktree_reuses_matching_path_and_rejects_wrong_branch(
         == path
     )
 
-    monkeypatch.setattr(
-        worktrees,
-        "_run_command",
-        lambda *_args, **_kwargs: completed_process(stdout="other\n"),
+    seen_cmds = []
+
+    def fake_run_recoverable(cmd, *_args, **_kwargs):
+        seen_cmds.append(cmd)
+        if cmd[:5] == ["git", "-C", str(path), "rev-parse", "--abbrev-ref"]:
+            return completed_process(stdout="other\n")
+        if cmd[:4] == ["git", "-C", str(path), "checkout"]:
+            return completed_process(returncode=0)
+        return completed_process(stdout="")
+
+    monkeypatch.setattr(worktrees, "_run_command", fake_run_recoverable)
+    assert (
+        worktrees._ensure_pr_worktree(
+            worktree_root=str(tmp_path),
+            pr_number=9,
+            branch="feature",
+        )
+        == path
     )
-    with pytest.raises(CommandError, match="instead of 'feature'"):
+    assert any(
+        cmd[:4] == ["git", "-C", str(path), "checkout"]
+        and "feature" in cmd
+        for cmd in seen_cmds
+    )
+
+    def fake_run_checkout_fails(cmd, *_args, **_kwargs):
+        if cmd[:5] == ["git", "-C", str(path), "rev-parse", "--abbrev-ref"]:
+            return completed_process(stdout="other\n")
+        if cmd[:4] == ["git", "-C", str(path), "checkout"]:
+            return completed_process(returncode=1, stderr="checkout failed")
+        return completed_process(stdout="")
+
+    monkeypatch.setattr(worktrees, "_run_command", fake_run_checkout_fails)
+    with pytest.raises(CommandError, match="Could not restore branch"):
         worktrees._ensure_pr_worktree(
             worktree_root=str(tmp_path),
             pr_number=9,

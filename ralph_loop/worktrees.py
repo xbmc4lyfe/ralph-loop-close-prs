@@ -275,14 +275,35 @@ def _ensure_pr_worktree(
             check=True,
             capture_output=True,
         )
-        if (worktree_branch.stdout or "").strip() != branch:
-            raise CommandError(
-                "Existing worktree {} is on branch '{}' instead of '{}'.".format(
-                    path,
-                    (worktree_branch.stdout or "").strip() or "<unknown>",
-                    branch,
-                )
+        current = (worktree_branch.stdout or "").strip()
+        if current != branch:
+            _print_step(
+                "Worktree {} is on '{}' instead of '{}'; restoring expected "
+                "branch.".format(path, current or "<unknown>", branch)
             )
+            _run_command(
+                ["git", "-C", path, "reset", "--hard", "HEAD"],
+                check=False,
+                capture_output=True,
+            )
+            _run_command(
+                ["git", "-C", path, "clean", "-fdx"],
+                check=False,
+                capture_output=True,
+            )
+            switch = _run_command(
+                ["git", "-C", path, "checkout", "-f", branch],
+                check=False,
+                capture_output=True,
+            )
+            if switch.returncode != 0:
+                raise CommandError(
+                    "Could not restore branch '{}' in worktree {}: {}".format(
+                        branch,
+                        path,
+                        (switch.stderr or switch.stdout or "").strip(),
+                    )
+                )
         _sync_existing_worktree(path=path, start_ref=start_ref)
         return path
     _print_step("Creating PR worktree {}".format(path))
