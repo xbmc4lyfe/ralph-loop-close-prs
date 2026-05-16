@@ -8,11 +8,40 @@ import textwrap
 from typing import List, Optional, Tuple
 
 from .checks import _failing_check_records, _format_failing_checks
-from .errors import CommandError
+from .errors import CodexEnvironmentError, CommandError
 from .process import _print_step, _run_command, _truncate_for_log
 
 
 CODEX_LAST_MESSAGE_LIMIT = 4000
+
+# Patterns that indicate codex itself (the upstream CLI / transport) is in an
+# unrecoverable environmental state rather than reporting a reviewable result.
+# Matching any of these means a respawn-immediately retry will just burn tokens
+# hitting the same error, so the supervisor should back off significantly.
+_CODEX_ENV_FAILURE_PATTERNS = (
+    re.compile(r"\b401\s+Unauthorized\b", re.IGNORECASE),
+    re.compile(r"Missing bearer or basic authentication", re.IGNORECASE),
+    re.compile(r"Reconnecting\.\.\.\s*5\s*/\s*5", re.IGNORECASE),
+    re.compile(
+        r"codex exec failed.*no partial last-message", re.IGNORECASE | re.DOTALL
+    ),
+)
+
+
+def _detect_codex_env_failure(*texts: str) -> Optional[str]:
+    """Return a short reason if any of the codex env-failure patterns match.
+
+    Each argument may be ``None`` or a string; they are inspected together so
+    callers can pass stdout, stderr, and any captured last-message at once.
+    """
+    for text in texts:
+        if not text:
+            continue
+        for pattern in _CODEX_ENV_FAILURE_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                return match.group(0)
+    return None
 
 
 def _extract_yes_no_marker(*, marker_regex: str, text: str) -> Optional[bool]:
@@ -61,18 +90,32 @@ def _codex_exec_with_marker(
         except FileNotFoundError:
             last_message = ""
     if completed.returncode != 0:
+        env_reason = _detect_codex_env_failure(
+            getattr(completed, "stdout", "") or "",
+            getattr(completed, "stderr", "") or "",
+            last_message,
+        )
         if last_message == "":
-            raise CommandError(
+            base_message = (
                 "codex exec failed (exit={}) with no partial last-message captured.".format(
                     completed.returncode
                 )
             )
-        raise CommandError(
-            "codex exec failed (exit={}); marker inference skipped. "
-            "partial last-message: {}".format(
-                completed.returncode, _truncate_for_log(last_message)
+        else:
+            base_message = (
+                "codex exec failed (exit={}); marker inference skipped. "
+                "partial last-message: {}".format(
+                    completed.returncode, _truncate_for_log(last_message)
+                )
             )
-        )
+        if env_reason is not None or last_message == "":
+            # An empty last-message on a failed run is itself one of the
+            # documented environmental failure modes, so escalate.
+            detail = env_reason or "no partial last-message captured"
+            raise CodexEnvironmentError(
+                "{} [env failure: {}]".format(base_message, detail)
+            )
+        raise CommandError(base_message)
     marker_value = _extract_yes_no_marker(
         marker_regex=marker_regex, text=last_message
     )

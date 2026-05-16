@@ -13,12 +13,15 @@ if sys.version_info < (3, 8):
     raise SystemExit(2)
 
 from ralph_loop.cli import main
-from ralph_loop.errors import CommandError
+from ralph_loop.errors import CODEX_ENV_FAILURE_EXIT_CODE, CodexEnvironmentError, CommandError
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except CodexEnvironmentError as exc:
+        sys.stderr.write("ERROR: codex environmental failure: {}\n".format(exc))
+        raise SystemExit(CODEX_ENV_FAILURE_EXIT_CODE)
     except CommandError as exc:
         sys.stderr.write("ERROR: {}\n".format(exc))
         raise SystemExit(1)

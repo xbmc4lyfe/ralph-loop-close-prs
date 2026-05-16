@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .checks import _wait_for_required_checks_green
 from .codex_agent import _run_ci_fix_round, _run_review_fix_round
 from .config import DEFAULT_WORKTREE_ROOT
-from .errors import CommandError
+from .errors import CODEX_ENV_FAILURE_EXIT_CODE, CodexEnvironmentError, CommandError
 from .gh_ops import (
     _list_open_prs,
     _mark_pr_needs_review,
@@ -182,6 +182,17 @@ def _parse_args() -> argparse.Namespace:
         type=_pos_int,
         default=5,
         help="Seconds to wait before respawning an exited fan-out child.",
+    )
+    parser.add_argument(
+        "--fan-out-env-failure-backoff-seconds",
+        type=_pos_int,
+        default=300,
+        help=(
+            "Seconds to wait before respawning a fan-out child that exited "
+            "with the codex environmental-failure exit code ({}). Defaults to "
+            "5 minutes so transient auth/transport issues don't burn tokens "
+            "in a tight respawn loop.".format(CODEX_ENV_FAILURE_EXIT_CODE)
+        ),
     )
     parser.add_argument(
         "directory",
@@ -364,19 +375,25 @@ def _fan_out_all_prs(
     os.makedirs(log_root, exist_ok=True)
     stuck_timeout = max(60, args.fan_out_stuck_timeout_seconds)
     respawn_backoff = max(1, args.fan_out_respawn_backoff_seconds)
+    env_failure_backoff = max(
+        respawn_backoff,
+        getattr(args, "fan_out_env_failure_backoff_seconds", 300),
+    )
     _print_step(
         "Fan-out supervisor: {} open PR(s): {} (logs in {}; stuck timeout {}s; "
-        "respawn backoff {}s)".format(
+        "respawn backoff {}s; env-failure backoff {}s)".format(
             len(pr_numbers),
             ", ".join("#" + str(n) for n in pr_numbers),
             log_root,
             stuck_timeout,
             respawn_backoff,
+            env_failure_backoff,
         )
     )
     base_child_args = _passthrough_args(argv)
     children: Dict[int, Tuple[subprocess.Popen, str, Any, float]] = {}
     last_exit_at: Dict[int, float] = {}
+    pending_backoff: Dict[int, float] = {}
     shutting_down = {"flag": False}
     shutdown_event = threading.Event()
 
@@ -416,11 +433,22 @@ def _fan_out_all_prs(
                         log_handle.close()
                     except OSError:
                         pass
-                    _print_step(
-                        "PR #{} loop exited with code {} (log: {}); respawning "
-                        "after {}s".format(pr, rc, log_path, respawn_backoff)
-                    )
+                    if rc == CODEX_ENV_FAILURE_EXIT_CODE:
+                        backoff_for_pr = env_failure_backoff
+                        _print_step(
+                            "PR #{} loop exited with codex env-failure code {} "
+                            "(log: {}); respawning after {}s (long backoff)".format(
+                                pr, rc, log_path, backoff_for_pr
+                            )
+                        )
+                    else:
+                        backoff_for_pr = respawn_backoff
+                        _print_step(
+                            "PR #{} loop exited with code {} (log: {}); respawning "
+                            "after {}s".format(pr, rc, log_path, backoff_for_pr)
+                        )
                     last_exit_at[pr] = now
+                    pending_backoff[pr] = backoff_for_pr
                     del children[pr]
                     continue
                 try:
@@ -453,6 +481,7 @@ def _fan_out_all_prs(
                     except OSError:
                         pass
                     last_exit_at[pr] = now
+                    pending_backoff[pr] = respawn_backoff
                     del children[pr]
             if shutting_down["flag"]:
                 break
@@ -472,10 +501,12 @@ def _fan_out_all_prs(
                             "set.".format(pr)
                         )
                         last_exit_at.pop(pr, None)
+                        pending_backoff.pop(pr, None)
             for pr in list(last_exit_at.keys()):
                 if pr in children:
                     continue
-                if time.monotonic() - last_exit_at[pr] < respawn_backoff:
+                backoff_for_pr = pending_backoff.get(pr, respawn_backoff)
+                if time.monotonic() - last_exit_at[pr] < backoff_for_pr:
                     continue
                 proc, log_path, log_handle = _spawn_child(
                     pr=pr,
@@ -485,6 +516,7 @@ def _fan_out_all_prs(
                 )
                 children[pr] = (proc, log_path, log_handle, time.monotonic())
                 last_exit_at.pop(pr, None)
+                pending_backoff.pop(pr, None)
                 _print_step(
                     "Respawned PR #{} pid={} (log: {})".format(
                         pr, proc.pid, log_path
@@ -816,6 +848,16 @@ def main() -> int:
             _merge_pr(pr_target)
         _print_step("Done.")
         return 0
+    except CodexEnvironmentError as exc:
+        sys.stderr.write(
+            "ERROR: codex environmental failure: {}\n"
+            "Exiting with code {} so the fan-out supervisor applies a long "
+            "backoff before respawning this PR's loop.\n".format(
+                exc, CODEX_ENV_FAILURE_EXIT_CODE
+            )
+        )
+        sys.stderr.flush()
+        return CODEX_ENV_FAILURE_EXIT_CODE
     finally:
         _set_command_deadline(previous_command_deadline)
         if pr_loop_lock is not None:

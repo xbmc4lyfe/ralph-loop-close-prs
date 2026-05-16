@@ -8,7 +8,11 @@ import sys
 import pytest
 
 from ralph_loop import cli
-from ralph_loop.errors import CommandError
+from ralph_loop.errors import (
+    CODEX_ENV_FAILURE_EXIT_CODE,
+    CodexEnvironmentError,
+    CommandError,
+)
 
 
 def test_parse_args_defaults_and_explicit_options(monkeypatch):
@@ -685,3 +689,168 @@ def test_compatibility_script_prints_command_error(monkeypatch, capsys):
 
     assert raised.value.code == 1
     assert "ERROR: boom" in capsys.readouterr().err
+
+
+def test_main_returns_env_failure_exit_code_when_codex_env_error_in_review_loop(
+    cli_harness, capsys
+):
+    harness = cli_harness()
+    harness.review_round.side_effect = CodexEnvironmentError(
+        "codex exec failed (exit=1) [env failure: 401 Unauthorized]"
+    )
+
+    rc = cli.main()
+
+    assert rc == CODEX_ENV_FAILURE_EXIT_CODE
+    stderr = capsys.readouterr().err
+    assert "codex environmental failure" in stderr
+    assert "long backoff" in stderr
+    # Lock must still be released even on env-failure exit path.
+    harness.lock.release.assert_called_once_with()
+
+
+def test_main_returns_env_failure_exit_code_when_codex_env_error_in_ci_loop(
+    cli_harness,
+):
+    harness = cli_harness()
+    harness.wait_checks.return_value = (False, [{"name": "unit", "bucket": "fail"}])
+    harness.ci_fix.side_effect = CodexEnvironmentError("transport gave up")
+
+    rc = cli.main()
+
+    assert rc == CODEX_ENV_FAILURE_EXIT_CODE
+
+
+def test_compatibility_script_exits_with_env_failure_code(monkeypatch, capsys):
+    path = os.path.join(os.getcwd(), "codex_ralph_wiggum_loop.py")
+
+    def boom():
+        raise CodexEnvironmentError("401 Unauthorized")
+
+    monkeypatch.setattr(cli, "main", boom)
+
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(path, run_name="__main__")
+
+    assert raised.value.code == CODEX_ENV_FAILURE_EXIT_CODE
+    stderr = capsys.readouterr().err
+    assert "codex environmental failure" in stderr
+    assert "401" in stderr
+
+
+def test_fan_out_supervisor_uses_long_backoff_after_env_failure_exit(
+    monkeypatch, cli_args, tmp_path
+):
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [99])
+    procs_made = []
+
+    def fake_popen(_cmd, **_kwargs):
+        # First child exits with the env-failure code; the supervisor must NOT
+        # respawn it after the short backoff.
+        exit_code = CODEX_ENV_FAILURE_EXIT_CODE if not procs_made else 0
+        proc = _FakeProc(
+            pid=500 + len(procs_made),
+            exit_after_polls=1,
+            returncode=exit_code,
+        )
+        procs_made.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["t"])
+
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        # Each poll cycle advances 30s of wall clock. With short backoff = 1s
+        # and env-failure backoff = 600s, the child should NOT be respawned
+        # within the first several poll cycles.
+        clock["t"] += 30.0
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 4:
+            event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_respawn_backoff_seconds=1,
+            fan_out_stuck_timeout_seconds=60,
+            fan_out_env_failure_backoff_seconds=600,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    # Initial spawn only; long backoff prevents respawn within the test window.
+    assert len(procs_made) == 1, (
+        "env-failure backoff should suppress respawn within 600s; got "
+        "{} spawns at t={:.0f}s".format(len(procs_made), clock["t"])
+    )
+
+
+def test_fan_out_supervisor_respawns_normally_after_short_backoff_for_nonzero_exit(
+    monkeypatch, cli_args, tmp_path
+):
+    # Non-env-failure exit code uses the short respawn backoff and DOES respawn
+    # within the test window. This guards against the long-backoff change
+    # accidentally applying to ordinary failures.
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [88])
+    procs_made = []
+
+    def fake_popen(_cmd, **_kwargs):
+        # First child exits with code 1 (ordinary failure); subsequent children
+        # stay alive for the rest of the test.
+        if not procs_made:
+            proc = _FakeProc(pid=600, exit_after_polls=1, returncode=1)
+        else:
+            proc = _FakeProc(pid=601, exit_after_polls=99, returncode=0)
+        procs_made.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["t"])
+
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        clock["t"] += 5.0
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 4:
+            event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_respawn_backoff_seconds=1,
+            fan_out_stuck_timeout_seconds=60,
+            fan_out_env_failure_backoff_seconds=600,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    assert len(procs_made) >= 2, "ordinary exit should respawn within short backoff"

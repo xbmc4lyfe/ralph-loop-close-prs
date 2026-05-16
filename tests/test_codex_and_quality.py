@@ -1,7 +1,7 @@
 import pytest
 
 from ralph_loop import codex_agent, quality
-from ralph_loop.errors import CommandError
+from ralph_loop.errors import CodexEnvironmentError, CommandError
 
 
 def test_extract_marker_requires_one_exact_marker_line_and_handles_missing_values():
@@ -153,6 +153,109 @@ def test_codex_exec_raises_when_failed_run_has_partial_last_message(
     assert "codex exec failed (exit=2)" in message
     assert "partial last-message" in message
     assert "REVIEW_PASS=no" in message
+    # A failure with a real partial last-message is reviewable text, not an
+    # environmental issue, so it should NOT escalate to CodexEnvironmentError.
+    assert not isinstance(raised.value, CodexEnvironmentError)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
+        "stream error: 401 unauthorized while contacting model",
+        "Reconnecting... 5/5",
+        "reconnecting... 5 / 5 then giving up",
+        "codex exec failed (exit=1) with no partial last-message captured.",
+    ],
+)
+def test_detect_codex_env_failure_matches_known_patterns(text):
+    assert codex_agent._detect_codex_env_failure(text) is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "Reconnecting... 1/5",
+        "ordinary review output",
+        "HTTP 500 internal server error",
+    ],
+)
+def test_detect_codex_env_failure_ignores_non_env_text(text):
+    assert codex_agent._detect_codex_env_failure(text) is None
+
+
+def test_detect_codex_env_failure_handles_none_arguments():
+    assert codex_agent._detect_codex_env_failure(None, "", None) is None
+    assert (
+        codex_agent._detect_codex_env_failure(None, "401 Unauthorized", None)
+        is not None
+    )
+
+
+def test_codex_exec_raises_env_error_when_stderr_shows_401(
+    monkeypatch, completed_process
+):
+    def fake_run(cmd, check, capture_output):
+        return completed_process(
+            returncode=1,
+            stderr=(
+                "unexpected status 401 Unauthorized: "
+                "Missing bearer or basic authentication in header\n"
+            ),
+        )
+
+    monkeypatch.setattr(codex_agent, "_run_command", fake_run)
+
+    with pytest.raises(CodexEnvironmentError) as raised:
+        codex_agent._codex_exec_with_marker(
+            prompt="prompt",
+            marker_regex=r"REVIEW_PASS=(yes|no)",
+            model=None,
+        )
+    # Subclass of CommandError so existing catch sites still work.
+    assert isinstance(raised.value, CommandError)
+    assert "env failure" in str(raised.value)
+    assert "401 Unauthorized" in str(raised.value)
+
+
+def test_codex_exec_raises_env_error_when_reconnect_exhausted(
+    monkeypatch, completed_process
+):
+    def fake_run(cmd, check, capture_output):
+        return completed_process(
+            returncode=1,
+            stderr="Reconnecting... 1/5\nReconnecting... 5/5\n",
+        )
+
+    monkeypatch.setattr(codex_agent, "_run_command", fake_run)
+
+    with pytest.raises(CodexEnvironmentError):
+        codex_agent._codex_exec_with_marker(
+            prompt="prompt",
+            marker_regex=r"REVIEW_PASS=(yes|no)",
+            model=None,
+        )
+
+
+def test_codex_exec_empty_last_message_failure_is_env_error(
+    monkeypatch, completed_process
+):
+    # The original "no partial last-message captured" condition itself is one
+    # of the documented environmental failure modes; it should now escalate to
+    # CodexEnvironmentError so the supervisor can long-backoff.
+    monkeypatch.setattr(
+        codex_agent,
+        "_run_command",
+        lambda *_a, **_kw: completed_process(returncode=2),
+    )
+
+    with pytest.raises(CodexEnvironmentError, match="no partial last-message"):
+        codex_agent._codex_exec_with_marker(
+            prompt="prompt",
+            marker_regex=r"REVIEW_PASS=(yes|no)",
+            model=None,
+        )
 
 
 def test_review_round_uses_marker_inference_and_error_paths(monkeypatch, spy):
