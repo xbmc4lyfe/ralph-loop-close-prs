@@ -103,6 +103,12 @@ cleanup_active_child() {
     if [[ -z "$ACTIVE_CHILD_PID" ]]; then
         return 0
     fi
+    kill "$ACTIVE_CHILD_PID" 2>/dev/null || true
+    if ! wait_for_pid_exit "$ACTIVE_CHILD_PID" 2 2>/dev/null; then
+        kill_descendants "$ACTIVE_CHILD_PID" || true
+        kill -KILL "$ACTIVE_CHILD_PID" 2>/dev/null || true
+        wait_for_pid_exit "$ACTIVE_CHILD_PID" 1 2>/dev/null || true
+    fi
     kill_descendants "$ACTIVE_CHILD_PID" || true
     ACTIVE_CHILD_PID=""
 }
@@ -278,14 +284,14 @@ with open(log_file, "a", encoding="utf-8") as log:
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, signal.SIGTERM)
-        except (LookupError, PermissionError):
+        except (ProcessLookupError, PermissionError):
             pass
         try:
             proc.wait(timeout=1)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
-            except (LookupError, PermissionError):
+            except (ProcessLookupError, PermissionError):
                 pass
             try:
                 proc.wait(timeout=1)
@@ -330,6 +336,7 @@ import time
 
 worktree = os.path.abspath(os.path.expanduser(sys.argv[1]))
 log_file = sys.argv[2]
+log_dir = os.path.dirname(os.path.abspath(log_file))
 needles = {worktree, os.path.realpath(worktree)}
 own_pids = {os.getpid(), os.getppid()}
 
@@ -362,8 +369,34 @@ def matching_pids():
     return pids
 
 
+def logged_pids():
+    pids = []
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return pids
+    for name in names:
+        if name == "random-repos-forever.pid":
+            continue
+        if not name.endswith(".pid"):
+            continue
+        path = os.path.join(log_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read().strip()
+        except OSError:
+            continue
+        if not text.isdigit():
+            continue
+        pid = int(text)
+        if pid in own_pids:
+            continue
+        pids.append(pid)
+    return pids
+
+
 def kill_matches(sig):
-    pids = matching_pids()
+    pids = sorted(set(matching_pids() + logged_pids()))
     if not pids:
         return False
     with open(log_file, "a", encoding="utf-8") as handle:
@@ -376,7 +409,7 @@ def kill_matches(sig):
     for pid in pids:
         try:
             os.kill(pid, sig)
-        except (LookupError, PermissionError):
+        except (ProcessLookupError, PermissionError):
             pass
     return True
 
@@ -495,6 +528,7 @@ repo = sys.argv[2]
 context_file = sys.argv[3]
 last_message = sys.argv[4]
 log_file = sys.argv[5]
+log_dir = os.path.dirname(os.path.abspath(log_file))
 model = sys.argv[6]
 reasoning_effort = sys.argv[7]
 service_tier = sys.argv[8]
@@ -575,18 +609,56 @@ def matching_repo_pids():
             pids.append(pid)
     return pids
 
+def logged_pids():
+    pids = []
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return pids
+    for name in names:
+        if name == "random-repos-forever.pid":
+            continue
+        if not name.endswith(".pid"):
+            continue
+        path = os.path.join(log_dir, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read().strip()
+        except OSError:
+            continue
+        if not text.isdigit():
+            continue
+        pid = int(text)
+        if pid in {os.getpid(), os.getppid(), proc.pid}:
+            continue
+        pids.append(pid)
+    return pids
+
 def kill_repo_processes(sig):
-    for pid in matching_repo_pids():
+    for pid in sorted(set(matching_repo_pids() + logged_pids())):
         try:
             os.kill(pid, sig)
-        except (LookupError, PermissionError):
+        except (ProcessLookupError, PermissionError):
             pass
 
 def kill_codex_group(sig):
     try:
         os.killpg(proc.pid, sig)
-    except (LookupError, PermissionError):
+    except (ProcessLookupError, PermissionError):
         pass
+
+def handle_shutdown(signum, _frame):
+    kill_codex_group(signum)
+    kill_repo_processes(signum)
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        kill_repo_processes(signal.SIGKILL)
+        kill_codex_group(signal.SIGKILL)
+    sys.exit(128 + signum)
+
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
 
 reader = threading.Thread(target=copy_output, daemon=True)
 reader.start()
