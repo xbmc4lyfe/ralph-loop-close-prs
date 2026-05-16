@@ -418,6 +418,39 @@ def _pr_view(pr_ref: str) -> dict:
     return data
 
 
+def _pr_is_still_open(pr_number: int) -> bool:
+    """Return True iff the PR is currently OPEN and not a draft.
+
+    Performs a targeted `gh pr view` rather than relying on the cached/
+    eventually-consistent `gh pr list` results. This is used to avoid spawning
+    or respawning fan-out children for PRs that have already been merged or
+    closed between supervisor cycles.
+
+    Behaviour:
+      - Returns True for OPEN, non-draft PRs.
+      - Returns False for any definitive non-OPEN state (MERGED, CLOSED) or
+        when the PR is in draft state.
+      - Raises CommandError for transient/network failures so the caller can
+        decide whether to keep the PR in the respawn set. We err on the side
+        of returning False only when GitHub explicitly tells us the PR is no
+        longer in scope.
+    """
+    pr_data = _pr_view(str(pr_number))
+    state = pr_data.get("state")
+    if not isinstance(state, str):
+        # Unexpected shape — treat as transient (raise) rather than silently
+        # dropping the PR.
+        raise CommandError(
+            "gh pr view for PR {} returned no state field; refusing to "
+            "interpret as not-open.".format(pr_number)
+        )
+    if state.upper() != "OPEN":
+        return False
+    if pr_data.get("isDraft"):
+        return False
+    return True
+
+
 _SOFT_FAIL_PATTERNS = (
     # CodeRabbit fails its check with this text when the org has run out of
     # review credits. The repo's review quality doesn't change with it, so

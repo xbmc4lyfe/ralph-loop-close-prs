@@ -19,6 +19,7 @@ from .gh_ops import (
     _list_open_prs,
     _mark_pr_needs_review,
     _merge_pr,
+    _pr_is_still_open,
     _pr_review_comments,
     _pr_view,
     _prepare_pr_for_merge,
@@ -361,10 +362,47 @@ def _spawn_child(
     return proc, log_path, log_handle
 
 
+def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
+    """Drop PRs that are no longer OPEN/non-draft via a targeted gh pr view.
+
+    `gh pr list` results can lag GitHub's authoritative state by tens of
+    seconds, so a PR that was merged moments before the supervisor started
+    can still appear in the initial list. Spawning a child for it just
+    wastes a process slot (the child errors out with "PR <N> is not open")
+    and produces noisy logs. A per-PR `gh pr view` is more authoritative.
+
+    Network/transient failures from `_pr_is_still_open` are surfaced as
+    "keep this PR" — we only drop PRs that GitHub definitively reports as
+    not-OPEN. This matches the behaviour callers expect: do not silently
+    swallow stale PRs because of a flaky network.
+    """
+    kept: List[int] = []
+    for pr in pr_numbers:
+        try:
+            still_open = _pr_is_still_open(pr)
+        except CommandError as exc:
+            _print_step(
+                "Could not confirm PR #{} open state ({}); keeping it in the "
+                "fan-out set.".format(pr, exc)
+            )
+            kept.append(pr)
+            continue
+        if still_open:
+            kept.append(pr)
+        else:
+            _print_step(
+                "PR #{} is no longer open (per gh pr view); skipping "
+                "fan-out spawn.".format(pr)
+            )
+    return kept
+
+
 def _fan_out_all_prs(
     args: argparse.Namespace, argv: List[str], script_path: str
 ) -> int:
     pr_numbers = _list_open_prs(args.base)
+    if pr_numbers:
+        pr_numbers = _filter_to_still_open_prs(pr_numbers)
     try:
         _cleanup_stale_loop_state(args.worktree_root, set(pr_numbers))
     except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
@@ -496,16 +534,25 @@ def _fan_out_all_prs(
             if shutting_down["flag"]:
                 break
             if last_exit_at:
-                try:
-                    still_open = set(_list_open_prs(args.base))
-                except CommandError as exc:
-                    _print_step(
-                        "Could not refresh open-PR list ({}); keeping current "
-                        "respawn set.".format(exc)
-                    )
-                    still_open = set(last_exit_at) | set(children)
+                # Use a per-PR `gh pr view` for each candidate respawn rather
+                # than `gh pr list`. The list endpoint has eventual-consistency
+                # lag where a just-merged PR is briefly absent or briefly still
+                # present; a targeted view returns the authoritative state. We
+                # only drop PRs on definitive non-OPEN results — transient
+                # failures bubble up as "keep in respawn set" so a flaky
+                # network does not silently lose work.
                 for pr in list(last_exit_at.keys()):
-                    if pr not in still_open:
+                    try:
+                        still_open = _pr_is_still_open(pr)
+                    except CommandError as exc:
+                        _print_step(
+                            "Could not confirm PR #{} open state for respawn "
+                            "({}); keeping it in the respawn set.".format(
+                                pr, exc
+                            )
+                        )
+                        continue
+                    if not still_open:
                         _print_step(
                             "PR #{} is no longer open; dropping from respawn "
                             "set.".format(pr)

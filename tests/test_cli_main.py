@@ -522,6 +522,7 @@ def test_fan_out_supervisor_respawns_exited_children_until_shutdown(
     monkeypatch, cli_args, tmp_path
 ):
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [50])
+    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
     procs_made = []
 
     def fake_popen(_cmd, **_kwargs):
@@ -570,6 +571,7 @@ def test_fan_out_supervisor_kills_idle_child_using_log_mtime_watchdog(
     monkeypatch, cli_args, tmp_path
 ):
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [33])
+    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
     procs_made = []
 
     def fake_popen(_cmd, **_kwargs):
@@ -676,6 +678,283 @@ def test_main_no_implicit_fan_out_when_on_feature_branch(
     harness.pr_view.assert_called_once_with("feature")
 
 
+def test_fan_out_skips_initial_spawn_for_prs_that_are_no_longer_open(
+    monkeypatch, cli_args, tmp_path
+):
+    """Stale PRs returned by `gh pr list` must be filtered before any spawn.
+
+    Regression: pr-101.log was showing repeated "PR 101 is not open
+    (state=MERGED)" errors because the initial list was used as-is, so the
+    supervisor wasted a child spawn on each stale PR every fan-out cycle.
+    """
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [50, 101, 77])
+
+    def fake_state(pr):
+        # 101 was merged between list and view.
+        return pr != 101
+
+    monkeypatch.setattr(cli, "_pr_is_still_open", fake_state)
+    spawned: List[int] = []
+
+    def fake_popen(cmd, **_kwargs):
+        # The PR number is the last argument (`--pr <n>`); record it.
+        spawned.append(int(cmd[-1]))
+        return _FakeProc(pid=900 + len(spawned), exit_after_polls=99)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 1:
+            event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+    monkeypatch.setattr(cli.os.path, "getmtime", lambda _path: 9e18)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_stuck_timeout_seconds=60,
+            fan_out_respawn_backoff_seconds=1,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    # 101 was filtered out; only the two truly-open PRs got spawned.
+    assert sorted(spawned) == [50, 77]
+
+
+def test_fan_out_keeps_pr_in_initial_set_when_open_check_raises(
+    monkeypatch, cli_args, tmp_path, capsys
+):
+    """Transient gh failures must not silently drop a PR from the set."""
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [50])
+
+    def boom(_pr):
+        raise CommandError("i/o timeout")
+
+    monkeypatch.setattr(cli, "_pr_is_still_open", boom)
+    spawned: List[int] = []
+
+    def fake_popen(cmd, **_kwargs):
+        spawned.append(int(cmd[-1]))
+        return _FakeProc(pid=800 + len(spawned), exit_after_polls=99)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli.os.path, "getmtime", lambda _path: 9e18)
+
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 1:
+            event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_stuck_timeout_seconds=60,
+            fan_out_respawn_backoff_seconds=1,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    assert spawned == [50]
+    stderr = capsys.readouterr().err
+    assert "Could not confirm PR #50 open state" in stderr
+
+
+def test_fan_out_returns_zero_when_all_initial_prs_are_filtered_out(
+    monkeypatch, cli_args, tmp_path
+):
+    """If every initial-list PR turns out to be merged, exit cleanly."""
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [101, 102])
+    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: False)
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda *a, **k: pytest.fail("should not spawn after filter"),
+    )
+
+    rc = cli._fan_out_all_prs(
+        cli_args(all_prs=True),
+        ["script.py", "--all-prs"],
+        str(tmp_path / "script.py"),
+    )
+
+    assert rc == 0
+
+
+def test_fan_out_respawn_block_uses_pr_is_still_open_to_drop_merged_prs(
+    monkeypatch, cli_args, tmp_path, capsys
+):
+    """Respawn path must consult `_pr_is_still_open`, not `_list_open_prs`.
+
+    Regression: when a child exits because its PR was merged, the supervisor
+    previously used `_list_open_prs` to refresh the respawn set, which can
+    lag GitHub's authoritative state by tens of seconds and cause a
+    just-merged PR to be respawned. A targeted view is authoritative.
+    """
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [50])
+    # Initial filter says PR is open; respawn-time check reports it merged.
+    open_state_calls: List[int] = []
+
+    def fake_state(pr):
+        open_state_calls.append(pr)
+        # First call (initial filter) -> True; subsequent (respawn check) -> False.
+        return len(open_state_calls) == 1
+
+    monkeypatch.setattr(cli, "_pr_is_still_open", fake_state)
+
+    list_open_calls = {"n": 0}
+
+    def fake_list(_base):
+        list_open_calls["n"] += 1
+        return [50]
+
+    monkeypatch.setattr(cli, "_list_open_prs", fake_list)
+
+    procs_made = []
+
+    def fake_popen(_cmd, **_kwargs):
+        proc = _FakeProc(pid=300 + len(procs_made), exit_after_polls=1)
+        procs_made.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["t"])
+
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        clock["t"] += 60.0
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 3:
+            event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_respawn_backoff_seconds=1,
+            fan_out_stuck_timeout_seconds=60,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    # The respawn block must not call `_list_open_prs`; it must rely on the
+    # targeted view instead. Only the initial spawn discovery call counts.
+    assert list_open_calls["n"] == 1
+    # Exactly one spawn (the initial); the respawn was suppressed by the
+    # targeted not-open check.
+    assert len(procs_made) == 1
+    stderr = capsys.readouterr().err
+    assert "PR #50 is no longer open" in stderr
+
+
+def test_fan_out_respawn_block_keeps_pr_when_state_check_raises(
+    monkeypatch, cli_args, tmp_path, capsys
+):
+    """Transient failures in the respawn-time check must not drop the PR."""
+    open_state_calls: List[int] = []
+
+    def fake_state(pr):
+        open_state_calls.append(pr)
+        # Initial filter -> True; respawn check -> raise transient error.
+        if len(open_state_calls) == 1:
+            return True
+        raise CommandError("i/o timeout")
+
+    monkeypatch.setattr(cli, "_pr_is_still_open", fake_state)
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [50])
+
+    procs_made = []
+
+    def fake_popen(_cmd, **_kwargs):
+        # First proc exits, second one runs forever (so we get exactly one
+        # respawn attempt before shutdown).
+        if not procs_made:
+            proc = _FakeProc(pid=400, exit_after_polls=1)
+        else:
+            proc = _FakeProc(pid=401, exit_after_polls=99)
+        procs_made.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(cli.os.path, "getmtime", lambda _path: 9e18)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["t"])
+
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        clock["t"] += 60.0
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 3:
+            event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_respawn_backoff_seconds=1,
+            fan_out_stuck_timeout_seconds=60,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    # Initial spawn + at least one respawn (since the transient error kept
+    # the PR in the respawn set).
+    assert len(procs_made) >= 2
+    stderr = capsys.readouterr().err
+    assert "Could not confirm PR #50 open state for respawn" in stderr
+
+
 def test_compatibility_script_prints_command_error(monkeypatch, capsys):
     path = os.path.join(os.getcwd(), "codex_ralph_wiggum_loop.py")
 
@@ -742,6 +1021,7 @@ def test_fan_out_supervisor_uses_long_backoff_after_env_failure_exit(
     monkeypatch, cli_args, tmp_path
 ):
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [99])
+    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
     procs_made = []
 
     def fake_popen(_cmd, **_kwargs):
@@ -807,6 +1087,7 @@ def test_fan_out_supervisor_respawns_normally_after_short_backoff_for_nonzero_ex
     # within the test window. This guards against the long-backoff change
     # accidentally applying to ordinary failures.
     monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [88])
+    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
     procs_made = []
 
     def fake_popen(_cmd, **_kwargs):

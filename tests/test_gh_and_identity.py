@@ -473,6 +473,79 @@ def test_list_open_prs_rejects_non_list_shape(monkeypatch):
         gh_ops._list_open_prs("main")
 
 
+def test_pr_is_still_open_returns_true_for_open_non_draft(monkeypatch):
+    monkeypatch.setattr(
+        gh_ops,
+        "_pr_view",
+        lambda _ref: {"state": "OPEN", "isDraft": False, "number": 101},
+    )
+
+    assert gh_ops._pr_is_still_open(101) is True
+
+
+def test_pr_is_still_open_returns_true_for_lowercase_open(monkeypatch):
+    # Some shapes/clients normalise state casing differently; be defensive.
+    monkeypatch.setattr(
+        gh_ops,
+        "_pr_view",
+        lambda _ref: {"state": "open", "isDraft": False, "number": 12},
+    )
+
+    assert gh_ops._pr_is_still_open(12) is True
+
+
+@pytest.mark.parametrize("state", ["MERGED", "CLOSED"])
+def test_pr_is_still_open_returns_false_for_non_open_states(monkeypatch, state):
+    monkeypatch.setattr(
+        gh_ops,
+        "_pr_view",
+        lambda _ref: {"state": state, "isDraft": False, "number": 101},
+    )
+
+    assert gh_ops._pr_is_still_open(101) is False
+
+
+def test_pr_is_still_open_returns_false_for_draft_open_pr(monkeypatch):
+    monkeypatch.setattr(
+        gh_ops,
+        "_pr_view",
+        lambda _ref: {"state": "OPEN", "isDraft": True, "number": 9},
+    )
+
+    assert gh_ops._pr_is_still_open(9) is False
+
+
+def test_pr_is_still_open_raises_on_transient_view_failure(monkeypatch):
+    def boom(_ref):
+        raise CommandError("i/o timeout")
+
+    monkeypatch.setattr(gh_ops, "_pr_view", boom)
+
+    with pytest.raises(CommandError, match="i/o timeout"):
+        gh_ops._pr_is_still_open(101)
+
+
+def test_pr_is_still_open_raises_when_state_field_missing(monkeypatch):
+    # Defensive: if gh returns an object without a state field we cannot
+    # safely call the PR "not open", so we surface the issue as transient.
+    monkeypatch.setattr(
+        gh_ops,
+        "_pr_view",
+        lambda _ref: {"number": 101, "isDraft": False},
+    )
+
+    with pytest.raises(CommandError, match="no state field"):
+        gh_ops._pr_is_still_open(101)
+
+
+def test_pr_is_still_open_uses_pr_number_as_string_ref(monkeypatch, spy):
+    view = spy(return_value={"state": "OPEN", "isDraft": False})
+    monkeypatch.setattr(gh_ops, "_pr_view", view)
+
+    assert gh_ops._pr_is_still_open(42) is True
+    view.assert_called_once_with("42")
+
+
 def test_pr_checks_soft_fails_coderabbit_insufficient_credits(monkeypatch):
     monkeypatch.setattr(
         gh_ops,
