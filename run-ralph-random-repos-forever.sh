@@ -113,6 +113,13 @@ cleanup_active_child() {
     ACTIVE_CHILD_PID=""
 }
 
+handle_runner_signal() {
+    local rc="$1"
+    trap - INT TERM
+    cleanup_active_iteration || true
+    exit "$rc"
+}
+
 clear_active_iteration() {
     ACTIVE_CHILD_PID=""
     ACTIVE_SOURCE_REPO=""
@@ -721,8 +728,8 @@ run_loop() {
     acquire_run_lock
     echo "$$" > "$PID_FILE"
     trap cleanup_run EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
+    trap 'handle_runner_signal 130' INT
+    trap 'handle_runner_signal 143' TERM
 
     mkdir -p "$WORKTREE_ROOT"
     local iteration=0
@@ -939,6 +946,9 @@ case "${1:-start}" in
             fi
             if pid_is_live "$pid"; then
                 kill_descendants "$pid"
+            fi
+            if pid_is_live "$pid"; then
+                kill -KILL "$pid" 2>/dev/null || true
             fi
             wait_for_pid_exit "$pid" 2>/dev/null || true
             rm -f "$PID_FILE"
