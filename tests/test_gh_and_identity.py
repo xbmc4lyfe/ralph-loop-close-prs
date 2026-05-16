@@ -496,24 +496,77 @@ def test_merge_pr_revalidates_remote_head_approves_explicit_commit_and_merges(
     monkeypatch.setattr(gh_ops, "_sign_off_pr", sign)
     monkeypatch.setattr(gh_ops, "_gh_run_with_retry", gh_run)
     monkeypatch.setattr(gh_ops, "_run_command", direct_run)
+    monkeypatch.setattr(
+        gh_ops,
+        "_pr_view",
+        lambda _ref: {"headRefName": "feature", "isCrossRepository": False},
+    )
 
     gh_ops._merge_pr("12")
 
     ensure_head.assert_called_once_with("12", "abc")
     sign.assert_called_once_with("12", head_sha="abc")
-    gh_run.assert_called_once_with(
+    merge_call, delete_call = gh_run.call_args_list[0], gh_run.call_args_list[1]
+    assert merge_call.args[0] == [
+        "pr",
+        "merge",
+        "12",
+        "--rebase",
+        "--match-head-commit",
+        "abc",
+    ]
+    assert merge_call.kwargs["check"] is False
+    assert delete_call.args[0] == [
+        "api",
+        "-X",
+        "DELETE",
+        "repos/{owner}/{repo}/git/refs/heads/feature",
+    ]
+
+
+def test_merge_pr_treats_already_merged_state_as_success(
+    monkeypatch, spy, completed_process
+):
+    monkeypatch.setattr(gh_ops, "_git_head_sha", lambda: "abc")
+    monkeypatch.setattr(gh_ops, "_ensure_pr_head_matches_local", lambda *a: None)
+    monkeypatch.setattr(gh_ops, "_sign_off_pr", lambda *a, **k: None)
+    pr_view_returns = iter(
         [
-            "pr",
-            "merge",
-            "12",
-            "--rebase",
-            "--delete-branch",
-            "--match-head-commit",
-            "abc",
-        ],
-        check=True,
-        capture_output=True,
+            {"state": "MERGED", "headRefName": "feature", "isCrossRepository": False},
+            {"headRefName": "feature", "isCrossRepository": False},
+        ]
     )
+    monkeypatch.setattr(gh_ops, "_pr_view", lambda _ref: next(pr_view_returns))
+    gh_run = spy(
+        side_effect=[
+            completed_process(returncode=1, stderr="local cleanup failed"),
+            completed_process(returncode=0),
+        ]
+    )
+    monkeypatch.setattr(gh_ops, "_gh_run_with_retry", gh_run)
+
+    gh_ops._merge_pr("12")
+
+    assert gh_run.call_count == 2
+
+
+def test_merge_pr_skips_branch_delete_for_fork_prs(
+    monkeypatch, spy, completed_process
+):
+    monkeypatch.setattr(gh_ops, "_git_head_sha", lambda: "abc")
+    monkeypatch.setattr(gh_ops, "_ensure_pr_head_matches_local", lambda *a: None)
+    monkeypatch.setattr(gh_ops, "_sign_off_pr", lambda *a, **k: None)
+    monkeypatch.setattr(
+        gh_ops,
+        "_pr_view",
+        lambda _ref: {"headRefName": "feature", "isCrossRepository": True},
+    )
+    gh_run = spy(return_value=completed_process(returncode=0))
+    monkeypatch.setattr(gh_ops, "_gh_run_with_retry", gh_run)
+
+    gh_ops._merge_pr("12")
+
+    assert gh_run.call_count == 1
 
 
 def test_truthy_and_ssh_public_key_detection():

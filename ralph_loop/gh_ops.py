@@ -374,21 +374,64 @@ def _ensure_pr_head_matches_local(pr_ref: str, head_sha: str):
         )
 
 
+def _delete_pr_head_branch(pr_ref: str):
+    pr_data = _pr_view(pr_ref)
+    if pr_data.get("isCrossRepository"):
+        return
+    head_branch = pr_data.get("headRefName")
+    if not head_branch:
+        return
+    completed = _gh_run_with_retry(
+        ["api", "-X", "DELETE", "repos/{owner}/{repo}/git/refs/heads/" + head_branch],
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode == 0:
+        _print_step("Deleted remote branch '{}'.".format(head_branch))
+    else:
+        _print_step(
+            "Could not delete remote branch '{}' (exit={}); leaving it in "
+            "place.".format(head_branch, completed.returncode)
+        )
+
+
 def _merge_pr(pr_ref: str):
     head_sha = _git_head_sha()
     _ensure_pr_head_matches_local(pr_ref, head_sha)
     _sign_off_pr(pr_ref, head_sha=head_sha)
     _print_step("Merging PR with rebase strategy")
-    _gh_run_with_retry(
+    completed = _gh_run_with_retry(
         [
             "pr",
             "merge",
             pr_ref,
             "--rebase",
-            "--delete-branch",
             "--match-head-commit",
             head_sha,
         ],
-        check=True,
+        check=False,
         capture_output=True,
     )
+    merged = completed.returncode == 0
+    if not merged:
+        pr_state = _pr_view(pr_ref).get("state")
+        if pr_state == "MERGED":
+            _print_step(
+                "gh pr merge exited {} but PR is MERGED on GitHub; treating "
+                "as success.".format(completed.returncode)
+            )
+            merged = True
+    if not merged:
+        raise CommandError(
+            "Command failed (exit={}): gh pr merge {}\n{}".format(
+                completed.returncode,
+                pr_ref,
+                (completed.stderr or completed.stdout or "").strip(),
+            )
+        )
+    try:
+        _delete_pr_head_branch(pr_ref)
+    except CommandError as exc:
+        _print_step(
+            "Best-effort branch deletion failed for PR {}: {}".format(pr_ref, exc)
+        )

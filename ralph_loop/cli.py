@@ -427,6 +427,22 @@ def _fan_out_all_prs(
                     del children[pr]
             if shutting_down["flag"]:
                 break
+            if last_exit_at:
+                try:
+                    still_open = set(_list_open_prs(args.base))
+                except CommandError as exc:
+                    _print_step(
+                        "Could not refresh open-PR list ({}); keeping current "
+                        "respawn set.".format(exc)
+                    )
+                    still_open = set(last_exit_at) | set(children)
+                for pr in list(last_exit_at.keys()):
+                    if pr not in still_open:
+                        _print_step(
+                            "PR #{} is no longer open; dropping from respawn "
+                            "set.".format(pr)
+                        )
+                        last_exit_at.pop(pr, None)
             for pr in list(last_exit_at.keys()):
                 if pr in children:
                     continue
