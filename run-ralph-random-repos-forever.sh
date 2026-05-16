@@ -130,6 +130,9 @@ clear_active_iteration() {
 run_interruptible() {
     "$@" &
     ACTIVE_CHILD_PID="$!"
+    while jobs -pr | grep -qx "$ACTIVE_CHILD_PID"; do
+        sleep 0.2
+    done
     wait "$ACTIVE_CHILD_PID"
     local rc=$?
     ACTIVE_CHILD_PID=""
@@ -322,13 +325,21 @@ remove_worktree() {
     fi
 
     git -C "$source_repo" worktree remove --force "$worktree" >> "$log_file" 2>&1 || rc=$?
+    if [[ "$rc" -ne 0 && -d "$worktree" ]]; then
+        echo "Retrying locked worktree removal with double force: $worktree" >> "$log_file"
+        git -C "$source_repo" worktree remove --force --force "$worktree" >> "$log_file" 2>&1 || rc=$?
+    fi
     if [[ -d "$worktree" ]]; then
         echo "Removing leftover worktree directory after git worktree remove: $worktree" >> "$log_file"
-        rm -rf "$worktree"
+        rm -rf "$worktree" >> "$log_file" 2>&1 || {
+            rc=1
+            echo "Could not remove leftover worktree directory; continuing: $worktree" >> "$log_file"
+        }
     fi
     if [[ "$rc" -ne 0 ]]; then
         git -C "$source_repo" worktree prune >> "$log_file" 2>&1 || true
     fi
+    return 0
 }
 
 kill_worktree_processes() {
@@ -904,10 +915,16 @@ case "${1:-start}" in
         fi
         rm -f "$PID_FILE"
         launcher="$SCRIPT_DIR/$(basename "$0")"
+        # Parents may ignore SIGTERM/SIGINT; Bash cannot trap signals that were
+        # ignored on entry, so reset them before execing the long-lived runner.
+        reset_signals_exec='import os, signal, sys
+for sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(sig, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])'
         if command -v setsid >/dev/null 2>&1; then
-            setsid -f "$launcher" run < /dev/null > /dev/null 2>> "$OUT_FILE"
+            setsid -f python3 -c "$reset_signals_exec" "$launcher" run < /dev/null > /dev/null 2>> "$OUT_FILE"
         else
-            nohup "$launcher" run < /dev/null > /dev/null 2>> "$OUT_FILE" &
+            nohup python3 -c "$reset_signals_exec" "$launcher" run < /dev/null > /dev/null 2>> "$OUT_FILE" &
         fi
         for _ in 1 2 3 4 5 6 7 8 9 10; do
             if is_running; then

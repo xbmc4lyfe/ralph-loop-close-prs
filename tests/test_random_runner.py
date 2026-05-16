@@ -2,6 +2,7 @@ import os
 import signal
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -734,6 +735,247 @@ printf 'codex_started\\n' >> "${RALPH_TEST_CALL_LOG}"
     assert not call_log.exists()
 
 
+def test_worktree_cleanup_failure_does_not_stop_runner(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "run-ralph-random-repos-forever.sh"
+    search_root = tmp_path / "repos"
+    source_repo = search_root / "sample"
+    log_dir = tmp_path / "logs"
+    prompt = tmp_path / "prompt.md"
+    fake_bin = tmp_path / "bin"
+    out_file = log_dir / "random-repos-forever.out"
+    worktree_root = log_dir / "worktrees"
+
+    (source_repo / ".git").mkdir(parents=True)
+    prompt.write_text("fake prompt\n")
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "git",
+        """#!/usr/bin/env bash
+set -euo pipefail
+repo=""
+if [[ "${1:-}" == "-C" ]]; then
+  repo="$2"
+  shift 2
+fi
+cmd="${1:-}"
+case "$cmd" in
+  rev-parse)
+    if [[ "${2:-}" == "--is-inside-work-tree" ]]; then
+      exit 0
+    fi
+    if [[ "${2:-}" == "HEAD" ]]; then
+      printf '1111111111111111111111111111111111111111\\n'
+      exit 0
+    fi
+    ;;
+  status)
+    exit 0
+    ;;
+  worktree)
+    if [[ "${2:-}" == "add" ]]; then
+      mkdir -p "$4"
+      printf 'simulated worktree add failure\\n' >&2
+      exit 1
+    fi
+    if [[ "${2:-}" == "remove" ]]; then
+      printf 'simulated worktree remove failure\\n' >&2
+      exit 1
+    fi
+    if [[ "${2:-}" == "prune" ]]; then
+      exit 0
+    fi
+    ;;
+esac
+exit 0
+""",
+    )
+    _write_executable(
+        fake_bin / "rm",
+        """#!/usr/bin/env bash
+set -euo pipefail
+for arg in "$@"; do
+  case "$arg" in
+    "${RALPH_TEST_FAIL_RM_ROOT}"/*)
+      printf 'rm: %s: Directory not empty\\n' "$arg" >&2
+      exit 1
+      ;;
+  esac
+done
+exec /bin/rm "$@"
+""",
+    )
+    _write_executable(
+        fake_bin / "codex",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf 'codex should not start after setup failure\\n' >&2
+exit 1
+""",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": str(fake_bin) + os.pathsep + env.get("PATH", ""),
+            "RALPH_RANDOM_LOG_DIR": str(log_dir),
+            "RALPH_RANDOM_WORKTREE_ROOT": str(worktree_root),
+            "RALPH_RANDOM_ROOT": str(source_repo),
+            "RALPH_RANDOM_PROMPT_FILE": str(prompt),
+            "RALPH_RANDOM_SECONDS": "5",
+            "RALPH_RANDOM_SLEEP_SECONDS": "1",
+            "RALPH_RANDOM_AGENT_ID": "test-agent",
+            "RALPH_TEST_FAIL_RM_ROOT": str(worktree_root),
+        }
+    )
+
+    proc = subprocess.Popen(
+        [str(script), "run"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if out_file.exists() and "selecting_repo iteration=2" in out_file.read_text():
+                break
+            if proc.poll() is not None:
+                raise AssertionError("runner exited after a worktree cleanup failure")
+            time.sleep(0.1)
+        else:
+            raise AssertionError("runner did not continue after a cleanup failure")
+    finally:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate(timeout=5)
+
+    assert _logs_contain(log_dir, "Could not create isolated worktree")
+    assert _logs_contain(log_dir, "Could not remove leftover worktree directory")
+
+
+def test_locked_initializing_worktree_cleanup_uses_double_force(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "run-ralph-random-repos-forever.sh"
+    search_root = tmp_path / "repos"
+    source_repo = search_root / "sample"
+    log_dir = tmp_path / "logs"
+    prompt = tmp_path / "prompt.md"
+    fake_bin = tmp_path / "bin"
+    call_log = tmp_path / "calls.log"
+
+    (source_repo / ".git").mkdir(parents=True)
+    prompt.write_text("fake prompt\n")
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "git",
+        """#!/usr/bin/env bash
+set -euo pipefail
+repo=""
+if [[ "${1:-}" == "-C" ]]; then
+  repo="$2"
+  shift 2
+fi
+cmd="${1:-}"
+case "$cmd" in
+  rev-parse)
+    if [[ "${2:-}" == "--is-inside-work-tree" ]]; then
+      exit 0
+    fi
+    if [[ "${2:-}" == "HEAD" ]]; then
+      printf '1111111111111111111111111111111111111111\\n'
+      exit 0
+    fi
+    ;;
+  status)
+    exit 0
+    ;;
+  worktree)
+    printf 'worktree %s\\n' "$*" >> "${RALPH_TEST_CALL_LOG}"
+    if [[ "${2:-}" == "add" ]]; then
+      mkdir -p "${4:-}"
+      printf 'fatal: Could not write new index file.\\n'
+      exit 128
+    fi
+    if [[ "${2:-}" == "remove" ]]; then
+      if [[ "${3:-}" == "--force" && "${4:-}" == "--force" ]]; then
+        rm -rf "${5:-}"
+        exit 0
+      fi
+      printf 'fatal: cannot remove a locked working tree, lock reason: initializing\\n'
+      printf 'use remove -f -f to override or unlock first\\n'
+      exit 128
+    fi
+    if [[ "${2:-}" == "prune" ]]; then
+      exit 0
+    fi
+    ;;
+  reset|clean)
+    exit 0
+    ;;
+esac
+exit 0
+""",
+    )
+    _write_executable(
+        fake_bin / "codex",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf 'codex should not start after setup failure\\n' >&2
+exit 1
+""",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": str(fake_bin) + os.pathsep + env.get("PATH", ""),
+            "RALPH_RANDOM_LOG_DIR": str(log_dir),
+            "RALPH_RANDOM_ROOT": str(source_repo),
+            "RALPH_RANDOM_PROMPT_FILE": str(prompt),
+            "RALPH_RANDOM_SECONDS": "5",
+            "RALPH_RANDOM_SLEEP_SECONDS": "1",
+            "RALPH_RANDOM_AGENT_ID": "test-agent",
+            "RALPH_TEST_CALL_LOG": str(call_log),
+        }
+    )
+
+    proc = subprocess.Popen(
+        [str(script), "run"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if call_log.exists() and "worktree remove --force" in call_log.read_text():
+                break
+            if proc.poll() is not None:
+                raise AssertionError("runner exited before worktree cleanup")
+            time.sleep(0.1)
+        else:
+            raise AssertionError("runner did not attempt worktree cleanup")
+    finally:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    calls = call_log.read_text()
+    assert "worktree remove --force --force" in calls
+
+
 def test_sigterm_cleans_active_iteration_worktree(tmp_path):
     repo_root = Path(__file__).resolve().parents[1]
     script = repo_root / "run-ralph-random-repos-forever.sh"
@@ -875,6 +1117,97 @@ sleep 30
     worktree = None
     try:
         _run([str(script), "start"], env=env, stdout=subprocess.PIPE)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if out_file.exists():
+                for line in out_file.read_text().splitlines():
+                    if line.startswith("worktree="):
+                        worktree = Path(line.split("=", 1)[1])
+                        break
+            if worktree is not None and worktree.exists():
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("runner did not create an active worktree")
+    finally:
+        subprocess.run([str(script), "stop"], env=env, stdout=subprocess.PIPE, text=True)
+
+    assert worktree is not None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not worktree.exists():
+            break
+        time.sleep(0.1)
+
+    assert not worktree.exists()
+
+
+def test_start_resets_ignored_signal_dispositions_for_runner(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "run-ralph-random-repos-forever.sh"
+    search_root = tmp_path / "repos"
+    source_repo = search_root / "sample"
+    log_dir = tmp_path / "logs"
+    prompt = tmp_path / "prompt.md"
+    fake_bin = tmp_path / "bin"
+    out_file = log_dir / "random-repos-forever.out"
+
+    source_repo.mkdir(parents=True)
+    _run(["git", "init"], cwd=str(source_repo), stdout=subprocess.DEVNULL)
+    (source_repo / "README.md").write_text("sample\n")
+    _run(["git", "add", "README.md"], cwd=str(source_repo))
+    _run(
+        [
+            "git",
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+        cwd=str(source_repo),
+        stdout=subprocess.DEVNULL,
+    )
+
+    prompt.write_text("fake prompt\n")
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "codex",
+        """#!/usr/bin/env bash
+set -euo pipefail
+sleep 30
+""",
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": str(fake_bin) + os.pathsep + env.get("PATH", ""),
+            "RALPH_RANDOM_LOG_DIR": str(log_dir),
+            "RALPH_RANDOM_ROOT": str(search_root),
+            "RALPH_RANDOM_PROMPT_FILE": str(prompt),
+            "RALPH_RANDOM_SECONDS": "30",
+            "RALPH_RANDOM_SLEEP_SECONDS": "60",
+            "RALPH_RANDOM_AGENT_ID": "test-agent",
+        }
+    )
+
+    ignored_launcher = (
+        "import os, signal, sys\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "os.execv(sys.argv[1], [sys.argv[1], 'start'])\n"
+    )
+
+    worktree = None
+    try:
+        _run(
+            [sys.executable, "-c", ignored_launcher, str(script)],
+            env=env,
+            stdout=subprocess.PIPE,
+        )
         deadline = time.time() + 15
         while time.time() < deadline:
             if out_file.exists():
