@@ -144,7 +144,8 @@ required checks have had time to appear.
 If merge is enabled, the script will:
 
 - add the `needs review` label to the PR
-- approve the PR as the authenticated GitHub user if needed
+- approve the PR as the authenticated GitHub user if needed, unless that user
+  authored the PR
 - merge with `gh pr merge --rebase --delete-branch --match-head-commit <sha>`
 
 ## CLI

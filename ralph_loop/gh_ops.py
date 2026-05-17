@@ -261,15 +261,24 @@ def _mark_pr_needs_review(pr_ref: str):
 
 def _sign_off_pr(pr_ref: str, head_sha: str = ""):
     gh_user = _active_gh_user()
+    pr_data = _gh_json(["pr", "view", pr_ref, "--json", "author"])
+    pr_author = (pr_data.get("author") or {}).get("login")
+    if pr_author == gh_user:
+        _print_step(
+            "Skipping PR approval for {} because {} authored the PR.".format(
+                pr_ref, gh_user
+            )
+        )
+        return
     if _pr_has_user_approval(pr_ref, gh_user):
         _print_step("PR {} already approved by {}".format(pr_ref, gh_user))
         return
     _print_step("Submitting PR approval as {}".format(gh_user))
     if head_sha:
         result = _gh_run_with_retry(
-                [
-                    "api",
-                    "repos/{{owner}}/{{repo}}/pulls/{}/reviews".format(pr_ref),
+            [
+                "api",
+                "repos/{{owner}}/{{repo}}/pulls/{}/reviews".format(pr_ref),
                 "-f",
                 "event=APPROVE",
                 "-f",

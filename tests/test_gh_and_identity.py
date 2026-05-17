@@ -368,6 +368,11 @@ def test_sign_off_pr_uses_retry_wrapper_for_review_mutation(
     gh_run = spy(return_value=completed_process())
     direct_run = spy(side_effect=AssertionError("direct gh command was used"))
     monkeypatch.setattr(gh_ops, "_active_gh_user", lambda: "me")
+    monkeypatch.setattr(
+        gh_ops,
+        "_gh_json",
+        lambda _args: {"author": {"login": "someone-else"}},
+    )
     monkeypatch.setattr(gh_ops, "_pr_has_user_approval", lambda _pr, _user: False)
     monkeypatch.setattr(gh_ops, "_gh_run_with_retry", gh_run)
     monkeypatch.setattr(gh_ops, "_run_command", direct_run)
@@ -383,6 +388,11 @@ def test_sign_off_pr_can_approve_an_explicit_head_commit(
 ):
     gh_run = spy(return_value=completed_process())
     monkeypatch.setattr(gh_ops, "_active_gh_user", lambda: "me")
+    monkeypatch.setattr(
+        gh_ops,
+        "_gh_json",
+        lambda _args: {"author": {"login": "someone-else"}},
+    )
     monkeypatch.setattr(gh_ops, "_pr_has_user_approval", lambda _pr, _user: False)
     monkeypatch.setattr(gh_ops, "_gh_run_with_retry", gh_run)
 
@@ -404,11 +414,38 @@ def test_sign_off_pr_can_approve_an_explicit_head_commit(
     )
 
 
+def test_sign_off_skips_self_authored_pr(monkeypatch, spy):
+    gh_run = spy(side_effect=AssertionError("approval command should not run"))
+    monkeypatch.setattr(gh_ops, "_active_gh_user", lambda: "me")
+    monkeypatch.setattr(
+        gh_ops,
+        "_gh_json",
+        lambda _args: {"author": {"login": "me"}},
+    )
+    monkeypatch.setattr(
+        gh_ops,
+        "_pr_has_user_approval",
+        lambda _pr, _user: (_ for _ in ()).throw(
+            AssertionError("approval lookup should not run")
+        ),
+    )
+    monkeypatch.setattr(gh_ops, "_gh_run_with_retry", gh_run)
+
+    gh_ops._sign_off_pr("9", head_sha="abc123")
+
+    gh_run.assert_not_called()
+
+
 def test_sign_off_skips_existing_approval_and_accepts_already_approved_error(
     monkeypatch, spy, completed_process
 ):
     gh_run = spy()
     monkeypatch.setattr(gh_ops, "_active_gh_user", lambda: "me")
+    monkeypatch.setattr(
+        gh_ops,
+        "_gh_json",
+        lambda _args: {"author": {"login": "someone-else"}},
+    )
     monkeypatch.setattr(gh_ops, "_pr_has_user_approval", lambda _pr, _user: True)
     monkeypatch.setattr(gh_ops, "_gh_run_with_retry", gh_run)
 
@@ -429,6 +466,11 @@ def test_sign_off_skips_existing_approval_and_accepts_already_approved_error(
 
 def test_sign_off_raises_for_review_failure(monkeypatch, completed_process):
     monkeypatch.setattr(gh_ops, "_active_gh_user", lambda: "me")
+    monkeypatch.setattr(
+        gh_ops,
+        "_gh_json",
+        lambda _args: {"author": {"login": "someone-else"}},
+    )
     monkeypatch.setattr(gh_ops, "_pr_has_user_approval", lambda _pr, _user: False)
     monkeypatch.setattr(
         gh_ops,
