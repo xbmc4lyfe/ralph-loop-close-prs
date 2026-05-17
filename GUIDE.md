@@ -480,10 +480,10 @@ Examples include:
 
 At the process boundary, `__main__` catches `CommandError`, prints `ERROR: ...` to stderr, and exits with status `1`.
 
-Codex environment failures use a dedicated exit code so fan-out supervisors can
-use a longer respawn backoff. Concurrency-style early exits for PRs already
-owned by another Ralph loop also use a dedicated status code for the same
-long-backoff behavior.
+Codex environment failures and rebase conflicts use dedicated exit codes so
+fan-out supervisors can use a longer respawn backoff. Concurrency-style early
+exits for PRs already owned by another Ralph loop also use a dedicated status
+code for the same long-backoff behavior.
 
 ## Filesystem and state side effects
 

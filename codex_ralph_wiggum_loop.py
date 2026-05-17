@@ -13,7 +13,13 @@ if sys.version_info < (3, 8):
     raise SystemExit(2)
 
 from ralph_loop.cli import main
-from ralph_loop.errors import CODEX_ENV_FAILURE_EXIT_CODE, CodexEnvironmentError, CommandError
+from ralph_loop.errors import (
+    CODEX_ENV_FAILURE_EXIT_CODE,
+    REBASE_CONFLICT_EXIT_CODE,
+    CodexEnvironmentError,
+    CommandError,
+    RebaseConflictError,
+)
 
 
 if __name__ == "__main__":
@@ -22,6 +28,9 @@ if __name__ == "__main__":
     except CodexEnvironmentError as exc:
         sys.stderr.write("ERROR: codex environmental failure: {}\n".format(exc))
         raise SystemExit(CODEX_ENV_FAILURE_EXIT_CODE)
+    except RebaseConflictError as exc:
+        sys.stderr.write("ERROR: rebase conflict: {}\n".format(exc))
+        raise SystemExit(REBASE_CONFLICT_EXIT_CODE)
     except CommandError as exc:
         sys.stderr.write("ERROR: {}\n".format(exc))
         raise SystemExit(1)

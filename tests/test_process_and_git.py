@@ -5,7 +5,7 @@ import sys
 import pytest
 
 from ralph_loop import git_ops, process
-from ralph_loop.errors import CommandError
+from ralph_loop.errors import CommandError, RebaseConflictError
 
 
 @pytest.fixture(autouse=True)
@@ -483,3 +483,30 @@ def test_rebase_fetches_rebases_and_force_pushes(monkeypatch, spy, completed_pro
         ["git", "rebase", "origin/main"],
         ["git", "push", "--force-with-lease", "origin", "feature"],
     ]
+
+
+def test_rebase_conflict_raises_dedicated_error_and_aborts(
+    monkeypatch, spy, completed_process
+):
+    responses = [
+        completed_process(),
+        completed_process(
+            returncode=1,
+            stdout="Auto-merging README.md\nCONFLICT (content): Merge conflict in README.md\n",
+            stderr="error: could not apply abc123... update docs\n",
+        ),
+        completed_process(),
+    ]
+    run = spy(side_effect=responses)
+    monkeypatch.setattr(git_ops, "_run_command", run)
+
+    with pytest.raises(RebaseConflictError, match="Rebase conflict"):
+        git_ops._rebase_onto_base("feature", "main")
+
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["git", "fetch", "origin", "main"],
+        ["git", "rebase", "origin/main"],
+        ["git", "rebase", "--abort"],
+    ]
+    assert run.call_args_list[1].kwargs["check"] is False
+    assert run.call_args_list[2].kwargs["check"] is False

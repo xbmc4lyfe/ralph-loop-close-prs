@@ -5,7 +5,7 @@ import sys
 from typing import Optional, Sequence
 
 from .config import LOOP_ALREADY_RUNNING_MESSAGE
-from .errors import CommandError
+from .errors import CommandError, RebaseConflictError
 from .process import _print_step, _run_command
 
 def _git_output(args: Sequence[str]) -> str:
@@ -102,6 +102,13 @@ _FETCH_TRANSIENT_PATTERNS = (
 
 _FETCH_MAX_ATTEMPTS = 6
 
+_REBASE_CONFLICT_PATTERNS = (
+    "conflict (",
+    "could not apply",
+    "resolve all conflicts",
+    "after resolving the conflicts",
+)
+
 
 def _fetch_with_retry(remote: str, ref: str):
     import random as _random
@@ -128,9 +135,25 @@ def _fetch_with_retry(remote: str, ref: str):
 def _rebase_onto_base(branch: str, base: str):
     _print_step("Rebasing {} onto origin/{}".format(branch, base))
     _fetch_with_retry("origin", base)
-    _run_command(
-        ["git", "rebase", "origin/{}".format(base)], check=True, capture_output=True
+    rebase = _run_command(
+        ["git", "rebase", "origin/{}".format(base)], check=False, capture_output=True
     )
+    if rebase.returncode != 0:
+        output = "{}\n{}".format(rebase.stdout or "", rebase.stderr or "").strip()
+        if any(pattern in output.lower() for pattern in _REBASE_CONFLICT_PATTERNS):
+            _run_command(
+                ["git", "rebase", "--abort"], check=False, capture_output=True
+            )
+            raise RebaseConflictError(
+                "Rebase conflict while rebasing '{}' onto origin/{}:\n{}".format(
+                    branch, base, output
+                )
+            )
+        raise CommandError(
+            "Command failed (exit={}): git rebase origin/{}\n{}".format(
+                rebase.returncode, base, output
+            ).strip()
+        )
     _run_command(
         ["git", "push", "--force-with-lease", "origin", branch],
         check=True,

@@ -11,8 +11,10 @@ import pytest
 from ralph_loop import cli, runtime
 from ralph_loop.errors import (
     CODEX_ENV_FAILURE_EXIT_CODE,
+    REBASE_CONFLICT_EXIT_CODE,
     CodexEnvironmentError,
     CommandError,
+    RebaseConflictError,
 )
 
 
@@ -1402,6 +1404,23 @@ def test_main_returns_env_failure_exit_code_when_codex_env_error_in_ci_loop(
     assert rc == CODEX_ENV_FAILURE_EXIT_CODE
 
 
+def test_main_returns_rebase_conflict_exit_code_and_releases_lock(
+    cli_harness, cli_args, capsys
+):
+    harness = cli_harness(args=cli_args(skip_rebase=False))
+    harness.rebase.side_effect = RebaseConflictError(
+        "Rebase conflict while rebasing feature"
+    )
+
+    rc = cli.main()
+
+    assert rc == REBASE_CONFLICT_EXIT_CODE
+    stderr = capsys.readouterr().err
+    assert "rebase conflict" in stderr
+    assert "long backoff" in stderr
+    harness.lock.release.assert_called_once_with()
+
+
 def test_compatibility_script_exits_with_env_failure_code(monkeypatch, capsys):
     path = os.path.join(os.getcwd(), "codex_ralph_wiggum_loop.py")
 
@@ -1417,6 +1436,23 @@ def test_compatibility_script_exits_with_env_failure_code(monkeypatch, capsys):
     stderr = capsys.readouterr().err
     assert "codex environmental failure" in stderr
     assert "401" in stderr
+
+
+def test_compatibility_script_exits_with_rebase_conflict_code(monkeypatch, capsys):
+    path = os.path.join(os.getcwd(), "codex_ralph_wiggum_loop.py")
+
+    def boom():
+        raise RebaseConflictError("Rebase conflict while rebasing feature")
+
+    monkeypatch.setattr(cli, "main", boom)
+
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(path, run_name="__main__")
+
+    assert raised.value.code == REBASE_CONFLICT_EXIT_CODE
+    stderr = capsys.readouterr().err
+    assert "rebase conflict" in stderr
+    assert "feature" in stderr
 
 
 def test_fan_out_supervisor_uses_long_backoff_after_env_failure_exit(
@@ -1480,6 +1516,64 @@ def test_fan_out_supervisor_uses_long_backoff_after_env_failure_exit(
         "env-failure backoff should suppress respawn within 600s; got "
         "{} spawns at t={:.0f}s".format(len(procs_made), clock["t"])
     )
+
+
+def test_fan_out_supervisor_uses_long_backoff_after_rebase_conflict_exit(
+    monkeypatch, cli_args, tmp_path, capfd
+):
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [77])
+    monkeypatch.setattr(cli, "_pr_is_still_open", lambda _pr: True)
+    procs_made = []
+
+    def fake_popen(_cmd, **_kwargs):
+        exit_code = REBASE_CONFLICT_EXIT_CODE if not procs_made else 0
+        proc = _FakeProc(
+            pid=700 + len(procs_made),
+            exit_after_polls=1,
+            returncode=exit_code,
+        )
+        procs_made.append(proc)
+        return proc
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock["t"])
+
+    wait_calls = {"n": 0}
+
+    def fake_wait(event, _timeout):
+        clock["t"] += 30.0
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 4:
+            event.set()
+            return True
+        return False
+
+    monkeypatch.setattr(cli, "_supervisor_wait", fake_wait)
+
+    script_path = tmp_path / "script.py"
+    script_path.write_text("# stub\n")
+    log_dir = tmp_path / "logs"
+
+    rc = cli._fan_out_all_prs(
+        cli_args(
+            all_prs=True,
+            fan_out_log_dir=str(log_dir),
+            fan_out_respawn_backoff_seconds=1,
+            fan_out_stuck_timeout_seconds=60,
+            fan_out_env_failure_backoff_seconds=600,
+        ),
+        ["script.py", "--all-prs"],
+        str(script_path),
+    )
+
+    assert rc == 0
+    assert len(procs_made) == 1, (
+        "rebase-conflict backoff should suppress respawn within 600s; got "
+        "{} spawns at t={:.0f}s".format(len(procs_made), clock["t"])
+    )
+    assert "rebase conflict" in capfd.readouterr().err
 
 
 def test_fan_out_supervisor_respawns_normally_after_short_backoff_for_nonzero_exit(

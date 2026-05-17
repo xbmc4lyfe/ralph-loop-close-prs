@@ -20,8 +20,10 @@ from .config import DEFAULT_WORKTREE_ROOT
 from .errors import (
     CODEX_ENV_FAILURE_EXIT_CODE,
     LOOP_ALREADY_RUNNING_EXIT_CODE,
+    REBASE_CONFLICT_EXIT_CODE,
     CodexEnvironmentError,
     CommandError,
+    RebaseConflictError,
 )
 from .gh_ops import (
     _list_open_prs,
@@ -680,6 +682,9 @@ def _fan_out_all_prs(
                     if rc == CODEX_ENV_FAILURE_EXIT_CODE:
                         backoff_for_pr = env_failure_backoff
                         reason = "codex env failure"
+                    elif rc == REBASE_CONFLICT_EXIT_CODE:
+                        backoff_for_pr = env_failure_backoff
+                        reason = "rebase conflict"
                     elif rc == LOOP_ALREADY_RUNNING_EXIT_CODE:
                         backoff_for_pr = env_failure_backoff
                         reason = "another ralph loop already owns this PR"
@@ -1364,6 +1369,16 @@ def main() -> int:
         )
         sys.stderr.flush()
         return CODEX_ENV_FAILURE_EXIT_CODE
+    except RebaseConflictError as exc:
+        sys.stderr.write(
+            "ERROR: rebase conflict: {}\n"
+            "Exiting with code {} so the fan-out supervisor applies a long "
+            "backoff before respawning this PR's loop.\n".format(
+                exc, REBASE_CONFLICT_EXIT_CODE
+            )
+        )
+        sys.stderr.flush()
+        return REBASE_CONFLICT_EXIT_CODE
     finally:
         _set_command_deadline(previous_command_deadline)
         _configure_json_log(previous_json_log)
