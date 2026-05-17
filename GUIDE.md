@@ -164,7 +164,9 @@ The worktree flow is:
    repo, verify its `origin` remote, restore the expected branch if needed, abort
    any interrupted rebase, and sync it to the fetched PR head only if doing so
    does not drop local commits.
-5. Otherwise create the worktree without resetting an existing local branch.
+5. Otherwise create the worktree without resetting an existing local branch. If
+   git reports the desired path is missing but still registered, prune stale
+   worktree registrations and retry that create operation once.
 
 After the worktree is ready, `main()` calls `os.chdir(worktree)` and all later git operations happen there.
 

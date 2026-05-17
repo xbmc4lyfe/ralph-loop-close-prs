@@ -411,6 +411,46 @@ def test_ensure_pr_worktree_does_not_reset_existing_unoccupied_local_branch(
     assert run.call_args.args[0] == ["git", "worktree", "add", result, "feature"]
 
 
+def test_ensure_pr_worktree_prunes_missing_registered_worktree_and_retries_add(
+    monkeypatch, tmp_path, spy, completed_process
+):
+    path = worktrees._worktree_path(
+        worktree_root=str(tmp_path), pr_number=9, branch="feature"
+    )
+    add_error = (
+        "fatal: '{}' is a missing but already registered worktree;\n"
+        "use 'add -f' to override, or 'prune' or 'remove' to clear"
+    ).format(path)
+    run = spy(
+        side_effect=[
+            completed_process(returncode=1, stderr=add_error),
+            completed_process(),
+            completed_process(),
+        ]
+    )
+    monkeypatch.setattr(
+        worktrees, "_fetch_pr_branch_or_head", lambda **_kwargs: "origin/feature"
+    )
+    monkeypatch.setattr(worktrees, "_worktree_for_branch", lambda _branch: path)
+    monkeypatch.setattr(worktrees, "_local_branch_exists", lambda _branch: True)
+    monkeypatch.setattr(worktrees, "_run_command", run)
+
+    assert (
+        worktrees._ensure_pr_worktree(
+            worktree_root=str(tmp_path),
+            pr_number=9,
+            branch="feature",
+        )
+        == path
+    )
+
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["git", "worktree", "add", path, "feature"],
+        ["git", "worktree", "prune"],
+        ["git", "worktree", "add", path, "feature"],
+    ]
+
+
 @pytest.mark.parametrize(
     ("stderr", "expected_exception", "expected_message"),
     [

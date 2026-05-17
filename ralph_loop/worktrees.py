@@ -563,6 +563,23 @@ def _ensure_pr_worktree(
     if result.returncode == 0:
         return path
     stderr = "{}\n{}".format(result.stdout or "", result.stderr or "").lower()
+    if "missing but already registered worktree" in stderr:
+        _print_step(
+            "Pruning stale git worktree registration for missing path {}".format(path)
+        )
+        _run_command(
+            ["git", "worktree", "prune"],
+            check=True,
+            capture_output=True,
+        )
+        result = _run_command(
+            add_cmd,
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return path
+        stderr = "{}\n{}".format(result.stdout or "", result.stderr or "").lower()
     if "already used by worktree" in stderr:
         sys.stdout.write("{}\n".format(LOOP_ALREADY_RUNNING_MESSAGE))
         sys.stdout.flush()

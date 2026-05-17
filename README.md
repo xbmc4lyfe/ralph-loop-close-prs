@@ -98,6 +98,8 @@ The script:
 - reuses the expected dedicated worktree path if it already exists
 - aborts any interrupted rebase in a reused PR worktree before syncing it to the
   fetched PR head
+- prunes a stale git registration and retries once if git reports the desired
+  worktree path is missing but still registered
 - exits with the loop-already-running code if the PR branch is checked out in
   any other worktree, so fan-out supervisors back off instead of tight-looping
 - acquires a persistent per-PR advisory lock at `/tmp/codex-ralph-loop-pr-<pr-number>.lock`
