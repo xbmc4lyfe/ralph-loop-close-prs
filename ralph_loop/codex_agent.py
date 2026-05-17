@@ -213,6 +213,9 @@ def _format_external_review_comments(comments: List[dict]) -> str:
     return "\n".join(lines)
 
 
+_ADDRESSED_COMMENT_BLOCK_START_PATTERN = re.compile(r"ADDRESSED_COMMENT_START=(\d+)\s*$")
+_ADDRESSED_COMMENT_SINGLE_PATTERN = re.compile(r"ADDRESSED_COMMENT=(\d+)\s*:?\s*(.*)$")
+
 def _parse_addressed_comments(text: str) -> List[Tuple[int, str]]:
     """Extract addressed-comment blocks from Codex output.
 
@@ -232,7 +235,10 @@ def _parse_addressed_comments(text: str) -> List[Tuple[int, str]]:
     handled_ids: set = set()
     while i < len(lines):
         line = lines[i].strip()
-        block_match = re.match(r"ADDRESSED_COMMENT_START=(\d+)\s*$", line)
+        if not line.startswith("ADDRESSED_COMMENT"):
+            i += 1
+            continue
+        block_match = _ADDRESSED_COMMENT_BLOCK_START_PATTERN.match(line)
         if block_match:
             comment_id = int(block_match.group(1))
             j = i + 1
@@ -246,7 +252,7 @@ def _parse_addressed_comments(text: str) -> List[Tuple[int, str]]:
                 handled_ids.add(comment_id)
             i = j + 1
             continue
-        single_match = re.match(r"ADDRESSED_COMMENT=(\d+)\s*:?\s*(.*)$", line)
+        single_match = _ADDRESSED_COMMENT_SINGLE_PATTERN.match(line)
         if single_match:
             comment_id = int(single_match.group(1))
             note = single_match.group(2).strip()
