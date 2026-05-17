@@ -55,7 +55,8 @@ def _is_generated_artifact_path(path: str) -> bool:
     if not normalized:
         return False
     parts = [part for part in normalized.split("/") if part]
-    if any(part in _GENERATED_ARTIFACT_DIRS for part in parts):
+    # isdisjoint in C is faster than any() with a python generator expression
+    if not _GENERATED_ARTIFACT_DIRS.isdisjoint(parts):
         return True
     filename = parts[-1]
     if filename in _GENERATED_ARTIFACT_FILES:
