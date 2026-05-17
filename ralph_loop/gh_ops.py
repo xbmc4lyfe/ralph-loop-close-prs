@@ -39,6 +39,7 @@ _GH_RATE_LIMIT_MARKERS = (
     "exceeded a secondary rate limit",
 )
 _GH_RATE_LIMIT_SLEEP_SECONDS = 300.0
+GH_OUTPUT_LIMIT = 2 << 20
 
 
 def _sleep_with_command_deadline(seconds: float, reason: str):
@@ -68,7 +69,7 @@ def _gh_run_with_retry(
             check=False,
             capture_output=capture_output,
             replay_output=False,
-            max_output_bytes=None if capture_output else None,
+            max_output_bytes=GH_OUTPUT_LIMIT if capture_output else None,
         )
         last_completed = completed
         if completed.returncode == 0:

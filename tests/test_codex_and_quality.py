@@ -620,6 +620,36 @@ def test_local_quality_gates_run_ci_then_test_and_report_first_failure(
     assert "<redacted>" in summary
 
 
+def test_local_quality_gates_redacts_urls_and_common_secret_assignments(
+    monkeypatch, completed_process
+):
+    secret_output = "\n".join(
+        [
+            "OPENAI_API_KEY=sk-live-secret",
+            "github_pat_1234567890abcdef",
+            "https://user:password@example.com/private/repo?token=abc",
+            "git@github.com:private/repo.git",
+        ]
+    )
+    monkeypatch.setattr(
+        quality,
+        "_run_command",
+        lambda *_args, **_kwargs: completed_process(
+            returncode=1,
+            stdout=secret_output,
+        ),
+    )
+
+    ok, summary = quality._run_local_quality_gates()
+
+    assert ok is False
+    assert "sk-live-secret" not in summary
+    assert "github_pat_1234567890abcdef" not in summary
+    assert "password@example.com/private/repo" not in summary
+    assert "git@github.com:private/repo.git" not in summary
+    assert "<redacted" in summary
+
+
 def test_commit_and_push_returns_no_changes_for_clean_tree_without_new_commits(
     monkeypatch
 ):
@@ -643,7 +673,7 @@ def test_commit_and_push_returns_no_changes_for_clean_tree_without_new_commits(
 
 def test_commit_and_push_discards_when_review_gate_fails(monkeypatch, spy):
     reset = spy()
-    monkeypatch.setattr(quality, "_git_head_sha", lambda: "def")
+    monkeypatch.setattr(quality, "_git_head_sha", lambda: "abc")
     monkeypatch.setattr(quality, "_working_tree_dirty", lambda: True)
     monkeypatch.setattr(quality, "_run_pre_push_review_gate", lambda **_kwargs: False)
     monkeypatch.setattr(quality, "_reset_generated_changes", reset)
@@ -778,6 +808,34 @@ def test_commit_and_push_discards_existing_new_commit_without_new_worktree_chang
     run.assert_not_called()
 
 
+def test_commit_and_push_discards_existing_new_commit_even_with_dirty_tree(
+    monkeypatch, spy, completed_process
+):
+    run = spy(return_value=completed_process())
+    reset = spy()
+    monkeypatch.setattr(quality, "_git_head_sha", lambda: "def")
+    monkeypatch.setattr(quality, "_working_tree_dirty", lambda: True)
+    monkeypatch.setattr(quality, "_run_local_quality_gates", lambda: (True, ""))
+    monkeypatch.setattr(quality, "_run_command", run)
+    monkeypatch.setattr(quality, "_reset_generated_changes", reset)
+
+    assert (
+        quality._commit_and_push(
+            "review round 1",
+            "feature",
+            base="main",
+            model=None,
+            require_review_gate=False,
+            review_gate_after_quality_fix=False,
+            max_local_quality_rounds=0,
+            pre_round_sha="abc",
+        )
+        == "discarded"
+    )
+    reset.assert_called_once_with("abc")
+    run.assert_not_called()
+
+
 def test_commit_and_push_cleans_filtered_artifacts_before_no_changes(
     monkeypatch, spy, completed_process
 ):
@@ -820,7 +878,15 @@ def test_commit_and_push_runs_quality_repair_and_reenables_review_gate(
 ):
     review = spy(return_value=True)
     repair = spy(return_value=True)
-    monkeypatch.setattr(quality, "_git_head_sha", lambda: "def")
+    commands = []
+
+    def fake_run(cmd, *_args, **_kwargs):
+        commands.append(cmd)
+        if cmd == ["git", "diff", "--cached", "--quiet"]:
+            return completed_process(returncode=1)
+        return completed_process()
+
+    monkeypatch.setattr(quality, "_git_head_sha", lambda: "abc")
     monkeypatch.setattr(
         quality,
         "_working_tree_dirty",
@@ -833,9 +899,7 @@ def test_commit_and_push_runs_quality_repair_and_reenables_review_gate(
         spy(side_effect=[(False, "fail"), (True, "")]),
     )
     monkeypatch.setattr(quality, "_run_local_quality_fix_round", repair)
-    monkeypatch.setattr(
-        quality, "_run_command", lambda *_args, **_kwargs: completed_process()
-    )
+    monkeypatch.setattr(quality, "_run_command", fake_run)
 
     assert (
         quality._commit_and_push(
@@ -852,6 +916,7 @@ def test_commit_and_push_runs_quality_repair_and_reenables_review_gate(
     )
     repair.assert_called_once_with(round_number=1, failure_summary="fail", model="m")
     review.assert_called_once_with(base="main", model="m")
+    assert ["git", "push", "origin", "feature"] in commands
 
 
 def test_commit_and_push_reports_local_quality_repair_telemetry(
@@ -859,7 +924,15 @@ def test_commit_and_push_reports_local_quality_repair_telemetry(
 ):
     telemetry = quality.LocalQualityTelemetry()
     repair = spy(return_value=True)
-    monkeypatch.setattr(quality, "_git_head_sha", lambda: "def")
+    commands = []
+
+    def fake_run(cmd, *_args, **_kwargs):
+        commands.append(cmd)
+        if cmd == ["git", "diff", "--cached", "--quiet"]:
+            return completed_process(returncode=1)
+        return completed_process()
+
+    monkeypatch.setattr(quality, "_git_head_sha", lambda: "abc")
     monkeypatch.setattr(
         quality,
         "_working_tree_dirty",
@@ -871,9 +944,7 @@ def test_commit_and_push_reports_local_quality_repair_telemetry(
         spy(side_effect=[(False, "fail"), (True, "")]),
     )
     monkeypatch.setattr(quality, "_run_local_quality_fix_round", repair)
-    monkeypatch.setattr(
-        quality, "_run_command", lambda *_args, **_kwargs: completed_process()
-    )
+    monkeypatch.setattr(quality, "_run_command", fake_run)
 
     assert (
         quality._commit_and_push(
@@ -891,13 +962,14 @@ def test_commit_and_push_reports_local_quality_repair_telemetry(
     )
 
     assert telemetry.repair_rounds == 1
+    assert ["git", "push", "origin", "feature"] in commands
 
 
 def test_commit_and_push_discards_when_quality_repair_cannot_continue(
     monkeypatch, spy
 ):
     reset = spy()
-    monkeypatch.setattr(quality, "_git_head_sha", lambda: "def")
+    monkeypatch.setattr(quality, "_git_head_sha", lambda: "abc")
     monkeypatch.setattr(quality, "_working_tree_dirty", lambda: True)
     monkeypatch.setattr(quality, "_run_local_quality_gates", lambda: (False, "fail"))
     monkeypatch.setattr(quality, "_run_local_quality_fix_round", lambda **_kwargs: False)
@@ -922,7 +994,7 @@ def test_commit_and_push_discards_when_quality_repair_cannot_continue(
 def test_commit_and_push_raises_after_quality_repair_rounds_are_exhausted(
     monkeypatch, spy
 ):
-    monkeypatch.setattr(quality, "_git_head_sha", lambda: "def")
+    monkeypatch.setattr(quality, "_git_head_sha", lambda: "abc")
     monkeypatch.setattr(quality, "_working_tree_dirty", lambda: True)
     monkeypatch.setattr(
         quality,

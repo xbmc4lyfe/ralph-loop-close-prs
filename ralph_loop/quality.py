@@ -35,6 +35,12 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization:\s*bearer\s+)[^\s]+"),
     re.compile(r"(?i)(token=)[^\s&]+"),
     re.compile(r"(?i)(password=)[^\s&]+"),
+    re.compile(
+        r"(?i)(\b[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*\s*=\s*)[^\s]+"
+    ),
+    re.compile(r"\b(?:ghp_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|sk-[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9_-]{8,})\b"),
+    re.compile(r"https?://[^\s]+"),
+    re.compile(r"\bgit@[^:\s]+:[^\s]+"),
 )
 
 
@@ -46,7 +52,10 @@ class LocalQualityTelemetry:
 def _redact_for_prompt(text: str) -> str:
     redacted = text
     for pattern in _SECRET_PATTERNS:
-        redacted = pattern.sub(r"\1<redacted>", redacted)
+        if pattern.groups >= 1:
+            redacted = pattern.sub(r"\1<redacted>", redacted)
+        else:
+            redacted = pattern.sub("<redacted>", redacted)
     return redacted
 
 
@@ -156,7 +165,7 @@ def _commit_and_push(
         if not dirty and not has_new_commits:
             _print_step("No changes to commit.")
             return "no_changes"
-        if not dirty and has_new_commits:
+        if has_new_commits:
             _print_step(
                 "Codex created commits directly; discarding them instead of pushing unreviewed commits."
             )

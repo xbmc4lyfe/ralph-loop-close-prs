@@ -279,6 +279,10 @@ The function compares:
 
 If neither changed, it returns `no_changes`.
 
+If `HEAD` changed relative to `pre_round_sha`, Ralph treats that as Codex
+creating commits directly and discards those commits instead of pushing
+unreviewed history.
+
 ### Optional pre-push review gate
 
 If `require_review_gate=True`, it runs `_run_pre_push_review_gate(...)`.
@@ -342,7 +346,8 @@ When the working tree is dirty after all gates pass, the script commits with:
 - `git add -- <non-generated untracked paths>`
 - `git commit --signoff -S -m "fix: codex loop <iteration label>" -m <coauthor line>`
 
-If the working tree is clean but new commits already exist, it skips creating another commit and just pushes.
+Direct commits created during a Codex round are discarded before this point, so
+Ralph only commits and pushes the gated working-tree changes it stages itself.
 
 Pushes are always sent to:
 

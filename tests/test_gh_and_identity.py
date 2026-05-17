@@ -37,7 +37,7 @@ def test_gh_run_with_retry_retries_transient_stderr_then_succeeds(
     sleep.assert_called_once_with(0.1)
 
 
-def test_gh_run_with_retry_uses_unbounded_capture_and_deadline_aware_sleep(
+def test_gh_run_with_retry_uses_bounded_capture_and_deadline_aware_sleep(
     monkeypatch, spy, completed_process
 ):
     run = spy(
@@ -57,7 +57,7 @@ def test_gh_run_with_retry_uses_unbounded_capture_and_deadline_aware_sleep(
         base_delay=0.1,
     )
 
-    assert run.call_args_list[0].kwargs["max_output_bytes"] is None
+    assert run.call_args_list[0].kwargs["max_output_bytes"] == gh_ops.GH_OUTPUT_LIMIT
     assert run.call_args_list[0].kwargs["replay_output"] is False
     sleep.assert_called_once_with(0.1, "gh retry backoff")
 
