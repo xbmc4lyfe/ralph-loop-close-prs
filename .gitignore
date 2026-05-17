@@ -9,5 +9,6 @@ htmlcov/
 .ralph-loop/
 .ralph-logs/
 .cloud/
+.claude/
 agents-source/
 agents2-research/
