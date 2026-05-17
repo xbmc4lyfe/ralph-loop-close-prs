@@ -431,7 +431,8 @@ If `--skip-merge` is not set, the script finishes by:
 `_merge_pr(...)`:
 
 1. captures the current `HEAD` SHA
-2. signs off / approves the PR if needed
+2. signs off / approves the PR if needed, unless the active GitHub user authored
+   the PR
 3. runs `gh pr merge <pr> --rebase --delete-branch --match-head-commit <sha>`
 
 That `--match-head-commit` guard makes the merge conditional on the head SHA still matching the local expectation.
