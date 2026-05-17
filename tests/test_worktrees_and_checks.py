@@ -660,6 +660,53 @@ def test_cleanup_stale_loop_state_keeps_open_pr_worktrees(monkeypatch, tmp_path)
     assert not drop.exists()
 
 
+def test_cleanup_stale_loop_state_skips_foreign_origin_worktrees(
+    monkeypatch, tmp_path
+):
+    import shutil as _shutil
+    import subprocess as _sp
+
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    worktree_root = tmp_path / "wt"
+    worktree_root.mkdir()
+    monkeypatch.setattr(worktrees.tempfile, "gettempdir", lambda: str(tmp_root))
+
+    source_origin = "git@github.com:owner/current.git"
+    foreign_origin = "git@github.com:owner/foreign.git"
+    current = worktree_root / "pr-51-merged"
+    current.mkdir()
+    foreign = worktree_root / "pr-52-other-repo"
+    foreign.mkdir()
+    removed = []
+
+    def fake_run(cmd, *_args, **_kwargs):
+        if cmd == ["git", "-C", str(current), "remote", "get-url", "origin"]:
+            return _sp.CompletedProcess(
+                args=cmd, returncode=0, stdout=source_origin + "\n", stderr=""
+            )
+        if cmd == ["git", "-C", str(foreign), "remote", "get-url", "origin"]:
+            return _sp.CompletedProcess(
+                args=cmd, returncode=0, stdout=foreign_origin + "\n", stderr=""
+            )
+        if cmd[:3] == ["git", "worktree", "remove"]:
+            removed.append(cmd[-1])
+            _shutil.rmtree(cmd[-1])
+            return _sp.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        raise AssertionError("unexpected command: {}".format(cmd))
+
+    monkeypatch.setattr(worktrees, "_run_command", fake_run)
+
+    counts = worktrees._cleanup_stale_loop_state(
+        str(worktree_root), open_pr_numbers=set(), source_origin=source_origin
+    )
+
+    assert counts["worktrees_removed"] == 1
+    assert removed == [str(current)]
+    assert not current.exists()
+    assert foreign.exists()
+
+
 def test_check_wall_clock_raises_after_deadline(monkeypatch):
     monkeypatch.setattr(runtime.time, "monotonic", lambda: 11)
 

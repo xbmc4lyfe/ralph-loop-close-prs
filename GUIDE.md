@@ -148,6 +148,9 @@ The worktree root defaults to:
 - `/private/tmp/codex-ralph-worktrees`
 
 The worktree path is derived from the PR number and a slugged branch name.
+Fan-out stale-state cleanup also checks each stale-looking worktree's `origin`
+remote before deleting it, so a supervisor for one repository does not remove
+active PR worktrees for another repository that shares the same root.
 
 The relevant helpers are:
 

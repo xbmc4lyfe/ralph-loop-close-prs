@@ -7,7 +7,7 @@ import re
 import shutil
 import sys
 import tempfile
-from typing import Dict, Optional, Set
+from typing import Callable, Dict, Optional, Set
 
 from .config import LOOP_ALREADY_RUNNING_MESSAGE
 from .errors import LOOP_ALREADY_RUNNING_EXIT_CODE, CommandError
@@ -138,8 +138,23 @@ def _lock_is_held_by_other_process(path: str) -> bool:
             pass
 
 
+def _worktree_origin(path: str) -> Optional[str]:
+    result = _run_command(
+        ["git", "-C", path, "remote", "get-url", "origin"],
+        check=False,
+        capture_output=True,
+        replay_output=False,
+    )
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip()
+
+
 def _cleanup_stale_loop_state(
-    worktree_root: str, open_pr_numbers: Set[int]
+    worktree_root: str,
+    open_pr_numbers: Set[int],
+    source_origin: Optional[str] = None,
+    source_origin_lookup: Optional[Callable[[], str]] = None,
 ) -> Dict[str, int]:
     """Remove lock files and worktree directories for PRs no longer open.
 
@@ -148,16 +163,19 @@ def _cleanup_stale_loop_state(
       unless another process currently holds an exclusive flock on it (that
       indicates a running supervisor or loop and must not be touched).
     - Scans ``worktree_root`` for ``pr-<N>-*`` directories. For any PR not in
-      ``open_pr_numbers``, attempts ``git worktree remove --force <path>``.
-      If git refuses or the path is not a registered worktree, falls back to
-      ``shutil.rmtree`` after verifying the path resolves under the
-      worktree_root.
+      ``open_pr_numbers`` and, when ``source_origin`` or
+      ``source_origin_lookup`` is provided, whose ``origin`` remote matches the
+      launching repo, attempts
+      ``git worktree remove --force <path>``. If git refuses or the path is not
+      a registered worktree, falls back to ``shutil.rmtree`` after verifying
+      the path resolves under the worktree_root.
     - Refuses to touch any path outside ``tempfile.gettempdir()`` (locks) or
       outside ``worktree_root`` (directories).
 
     Returns a dict with keys ``locks_removed`` and ``worktrees_removed``.
     """
     counts = {"locks_removed": 0, "worktrees_removed": 0}
+    resolved_source_origin = source_origin
     tmp_root = tempfile.gettempdir()
     try:
         tmp_entries = os.listdir(tmp_root)
@@ -243,6 +261,21 @@ def _cleanup_stale_loop_state(
                     "worktree root: {}".format(entry_path)
                 )
                 continue
+            if resolved_source_origin is None and source_origin_lookup is not None:
+                resolved_source_origin = source_origin_lookup()
+            if resolved_source_origin is not None:
+                entry_origin = _worktree_origin(entry_path)
+                if entry_origin != resolved_source_origin:
+                    _print_step(
+                        "Stale-state cleanup: leaving {} in place because "
+                        "origin {} does not match launching repo origin "
+                        "{}.".format(
+                            entry_path,
+                            entry_origin or "<unknown>",
+                            resolved_source_origin or "<unknown>",
+                        )
+                    )
+                    continue
             removed = False
             try:
                 result = _run_command(

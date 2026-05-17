@@ -742,6 +742,42 @@ def test_fan_out_all_prs_returns_zero_when_no_open_prs(
     assert rc == 0
 
 
+def test_fan_out_cleanup_is_scoped_to_launching_repo_origin(
+    monkeypatch, cli_args, tmp_path
+):
+    monkeypatch.setattr(cli, "_list_open_prs", lambda _base: [])
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: pytest.fail("spawn"))
+    cleanup_calls = []
+
+    def fake_cleanup(worktree_root, open_pr_numbers, **kwargs):
+        cleanup_calls.append((worktree_root, open_pr_numbers, kwargs))
+
+    def fake_run(cmd, **_kwargs):
+        assert cmd == ["git", "remote", "get-url", "origin"]
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout="git@github.com:owner/current.git\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli, "_cleanup_stale_loop_state", fake_cleanup)
+    monkeypatch.setattr(cli, "_run_command", fake_run)
+
+    rc = cli._fan_out_all_prs(
+        cli_args(all_prs=True, worktree_root="/tmp/shared-ralph-worktrees"),
+        ["script.py", "--all-prs"],
+        str(tmp_path / "script.py"),
+    )
+
+    assert rc == 0
+    assert len(cleanup_calls) == 1
+    worktree_root, open_pr_numbers, kwargs = cleanup_calls[0]
+    assert worktree_root == "/tmp/shared-ralph-worktrees"
+    assert open_pr_numbers == set()
+    assert kwargs["source_origin_lookup"]() == "git@github.com:owner/current.git"
+
+
 def test_fan_out_supervisor_respawns_exited_children_until_shutdown(
     monkeypatch, cli_args, tmp_path
 ):

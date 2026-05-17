@@ -100,6 +100,9 @@ The script:
   fetched PR head
 - prunes a stale git registration and retries once if git reports the desired
   worktree path is missing but still registered
+- scopes fan-out stale worktree cleanup to the launching repo's `origin` remote,
+  so another repo's supervisor cannot remove active PR worktrees that happen to
+  share the same worktree root
 - exits with the loop-already-running code if the PR branch is checked out in
   any other worktree, so fan-out supervisors back off instead of tight-looping
 - acquires a persistent per-PR advisory lock at `/tmp/codex-ralph-loop-pr-<pr-number>.lock`

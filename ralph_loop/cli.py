@@ -41,7 +41,12 @@ from .git_ops import (
     _working_tree_dirty,
 )
 from .identity import _ensure_runtime_identity, _validate_identity_and_signing
-from .process import _configure_json_log, _print_step, _set_command_deadline
+from .process import (
+    _configure_json_log,
+    _print_step,
+    _run_command,
+    _set_command_deadline,
+)
 from .quality import LocalQualityTelemetry, _commit_and_push
 from .runtime import _check_wall_clock
 from .worktrees import (
@@ -557,6 +562,23 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     return kept
 
 
+def _cleanup_source_origin() -> str:
+    result = _run_command(
+        ["git", "remote", "get-url", "origin"],
+        check=False,
+        capture_output=True,
+        replay_output=False,
+    )
+    if result.returncode != 0:
+        _print_step(
+            "Stale-state cleanup: could not determine launching repo origin; "
+            "worktree directory cleanup will skip entries whose origin cannot "
+            "be confirmed."
+        )
+        return ""
+    return (result.stdout or "").strip()
+
+
 def _fan_out_all_prs(
     args: argparse.Namespace, argv: List[str], script_path: str
 ) -> int:
@@ -564,7 +586,11 @@ def _fan_out_all_prs(
     if pr_numbers:
         pr_numbers = _filter_to_still_open_prs(pr_numbers)
     try:
-        _cleanup_stale_loop_state(args.worktree_root, set(pr_numbers))
+        _cleanup_stale_loop_state(
+            args.worktree_root,
+            set(pr_numbers),
+            source_origin_lookup=_cleanup_source_origin,
+        )
     except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
         _print_step(
             "Stale-state cleanup failed before fan-out (continuing): {}".format(exc)
