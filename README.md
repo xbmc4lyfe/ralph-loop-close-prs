@@ -33,7 +33,7 @@ For a full end-to-end walkthrough of the current behavior, see `GUIDE.md`.
   polling.
 - `ralph_loop/quality.py`: local `just ci` / `just test` gates and commit/push
   retry flow.
-- `ralph_loop/runtime.py`: wall-clock deadline and round-number helpers.
+- `ralph_loop/runtime.py`: wall-clock deadline helper.
 - `tests/`: pytest coverage for CLI orchestration, Codex prompts, local quality
   gates, git/GitHub helpers, identity setup, process handling, worktrees,
   check polling, and pure helper behavior.
@@ -165,10 +165,12 @@ Important flags:
 - `--dry-run`: resolve and validate the PR, then stop before local or remote mutations
 - `--worktree-root <path>`: override the worktree root
 - `--max-wall-clock-seconds <n>`: cap total runtime, including subprocesses and local quality repair, `0` means unlimited
+- `--json-log <path>`: append structured JSON-lines events to a file
 
 `--dry-run` is a safe preflight mode. It does not update git config, create or
 reuse worktrees, add labels, run Codex, run quality gates, rebase, push, reset,
-approve, merge, or delete branches.
+approve, merge, or delete branches. It also prints a downstream simulation plan
+showing the mutating phases Ralph would have attempted.
 
 Example:
 
@@ -185,9 +187,13 @@ python3 codex_ralph_wiggum_loop.py --pr 123 --base main --skip-merge
   returned or replayed to logs.
 - `codex exec` prompts are sent on stdin and redacted in command logs, so they
   are not printed as giant argv lines.
+- Successful single-PR runs emit a final telemetry line with review round count,
+  CI wait count, CI repair round count, local quality repair round count,
+  review duration, CI duration, and total wall-clock duration.
+- When `--json-log` is set, step output, dry-run simulation events, and final
+  telemetry are also appended as one JSON object per line.
 
 ## Small TODO
 
-- Continue hardening the high-impact behaviors tracked in `BUGS.md`.
-- Add broader integration-style coverage for git/GitHub edge cases with mocks
-  or a safe dry-run path before using a real PR.
+- Continue adding focused regression coverage when new Ralph failure modes are
+  found in real or mocked PR runs.

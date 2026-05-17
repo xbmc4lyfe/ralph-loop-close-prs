@@ -89,15 +89,16 @@ The script exposes these arguments:
 - `--dry-run`: resolve and validate the PR, then stop before local or remote mutations
 - `--worktree-root <path>`: override the root directory for PR worktrees
 - `--max-wall-clock-seconds <n>`: cap total runtime at loop, subprocess, local-quality repair, and check-polling boundaries; `0` means unbounded
+- `--json-log <path>`: append structured JSON-lines events to a file
 
 The integer parsers `_nonneg_int()` and `_pos_int()` enforce valid numeric flag values before execution starts.
 
 `--dry-run` is intentionally preflight-only. It reads the current branch when
 needed, fetches PR metadata with `gh pr view`, applies the normal PR metadata
-checks, prints the planned target, and exits. It does not update git config,
-acquire the PR lock, create or reuse a worktree, change directories, add labels,
-run Codex, run quality gates, wait for checks, rebase, push, reset generated
-changes, approve, merge, or delete branches.
+checks, prints the planned target plus a downstream simulation plan, and exits.
+It does not update git config, acquire the PR lock, create or reuse a worktree,
+change directories, add labels, run Codex, run quality gates, wait for checks,
+rebase, push, reset generated changes, approve, merge, or delete branches.
 
 ## PR resolution and validation
 
@@ -346,13 +347,15 @@ Pushes are always sent to:
 
 After the review loop succeeds, the script waits for GitHub checks through `_wait_for_required_checks_green(...)`.
 
-It polls with `_required_checks(branch)`, which prefers:
+Single-PR runs poll by PR number instead of head branch so a numeric branch name
+cannot be confused with a different GitHub PR number. Internally this calls the
+required-check helper for that PR reference, which prefers:
 
-- `gh pr checks --required`
+- `gh pr checks --required <pr-number>`
 
 and falls back to:
 
-- `gh pr checks`
+- `gh pr checks <pr-number>`
 
 if no required checks are reported.
 
@@ -431,9 +434,10 @@ The three main retrying phases are:
 - local quality repair rounds
 - CI repair rounds
 
-All three are driven by `_round_numbers(max_rounds)`.
-
-If a max round count is `0`, the generator is intentionally unbounded. If it is positive, the generator stops at that cap.
+Review and CI loops advance explicit round counters. If a max round count is
+`0`, the loop is intentionally unbounded. If it is positive, the loop stops at
+that cap. Local quality repair rounds use the same bounded/unbounded counter
+inside `_commit_and_push(...)`.
 
 That means the default behavior can continue indefinitely unless one of these happens:
 
@@ -441,6 +445,21 @@ That means the default behavior can continue indefinitely unless one of these ha
 - a command errors out
 - a configured timeout is hit
 - the operator interrupts the process
+
+Successful single-PR runs emit a final telemetry line to stderr with:
+
+- review round count
+- CI wait count
+- CI repair round count
+- local quality repair round count
+- review phase duration
+- CI phase duration
+- total wall-clock duration
+
+If `--json-log <path>` is set, Ralph appends the same step stream as structured
+JSON-lines records. Dry-run validation and simulation steps use
+`dry_run.*` event names, and the final successful telemetry record uses
+`run.telemetry`.
 
 ## Failure model
 

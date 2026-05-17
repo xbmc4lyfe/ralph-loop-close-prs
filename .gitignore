@@ -8,5 +8,6 @@ htmlcov/
 .mypy_cache/
 .ralph-loop/
 .ralph-logs/
+.cloud/
 agents-source/
 agents2-research/

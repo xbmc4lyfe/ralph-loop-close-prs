@@ -46,15 +46,21 @@ def _format_failing_checks(records: Sequence[dict]) -> str:
     return "\n".join(lines)
 
 
+def _required_checks_for_ref(pr_ref: str) -> Tuple[list, bool]:
+    return _required_checks(pr_ref)
+
+
 def _wait_for_required_checks_green(
     *,
     branch: str,
+    pr_number: Optional[int] = None,
     poll_seconds: int,
     timeout_seconds: int,
     deadline: Optional[float] = None,
     no_checks_grace_seconds: int = 120,
 ) -> Tuple[bool, list]:
-    _print_step("Waiting for required checks on PR branch {}".format(branch))
+    pr_ref = str(pr_number) if pr_number is not None else branch
+    _print_step("Waiting for required checks on PR {}".format(pr_ref))
     started = time.monotonic()
 
     def sleep_for_next_poll():
@@ -76,7 +82,7 @@ def _wait_for_required_checks_green(
 
     while True:
         _check_wall_clock(deadline)
-        checks, were_required = _required_checks(branch)
+        checks, were_required = _required_checks_for_ref(pr_ref)
         if not checks:
             elapsed = time.monotonic() - started
             if elapsed >= no_checks_grace_seconds:

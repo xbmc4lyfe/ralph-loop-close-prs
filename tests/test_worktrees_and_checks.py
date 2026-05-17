@@ -64,6 +64,19 @@ def test_loop_lock_rejects_preexisting_symlink(monkeypatch, tmp_path):
     assert target.read_text(encoding="utf-8") == "do not clobber\n"
 
 
+def test_loop_lock_uses_no_follow_when_opening_lock_file(monkeypatch, tmp_path, spy):
+    monkeypatch.setattr(worktrees.tempfile, "gettempdir", lambda: str(tmp_path))
+    real_open = worktrees.os.open
+    open_spy = spy(side_effect=real_open)
+    monkeypatch.setattr(worktrees.os, "open", open_spy)
+
+    lock = worktrees._acquire_loop_lock(pr_number=123)
+    lock.release()
+
+    _path, flags, _mode = open_spy.call_args.args
+    assert flags & getattr(os, "O_NOFOLLOW", 0)
+
+
 def test_worktree_path_slugifies_branch_name(tmp_path):
     assert worktrees._worktree_path(
         worktree_root=str(tmp_path),
@@ -615,12 +628,6 @@ def test_check_wall_clock_raises_after_deadline(monkeypatch):
     runtime._check_wall_clock(None)
 
 
-def test_round_numbers_supports_bounded_and_unbounded_modes():
-    assert list(runtime._round_numbers(3)) == [1, 2, 3]
-    generator = runtime._round_numbers(0)
-    assert [next(generator), next(generator), next(generator)] == [1, 2, 3]
-
-
 def test_check_formatting_summarizes_and_lists_failures():
     check_records = [
         {"name": "unit", "bucket": "pass", "state": "SUCCESS"},
@@ -645,7 +652,7 @@ def test_check_formatting_summarizes_and_lists_failures():
 def test_wait_for_checks_green_polls_until_checks_appear(monkeypatch, spy):
     monkeypatch.setattr(
         checks,
-        "_required_checks",
+        "_required_checks_for_ref",
         spy(side_effect=[([], True), ([{"name": "unit", "bucket": "pass"}], True)]),
     )
     sleep = spy()
@@ -659,8 +666,22 @@ def test_wait_for_checks_green_polls_until_checks_appear(monkeypatch, spy):
     sleep.assert_called_once_with(1)
 
 
+def test_wait_for_checks_green_uses_pr_number_when_provided(monkeypatch, spy):
+    required_checks = spy(return_value=([{"name": "unit", "bucket": "pass"}], True))
+    monkeypatch.setattr(checks, "_required_checks_for_ref", required_checks)
+
+    assert checks._wait_for_required_checks_green(
+        branch="123",
+        pr_number=77,
+        poll_seconds=1,
+        timeout_seconds=10,
+    ) == (True, [{"name": "unit", "bucket": "pass"}])
+
+    required_checks.assert_called_once_with("77")
+
+
 def test_wait_for_checks_green_returns_success_after_no_checks_grace(monkeypatch, spy):
-    monkeypatch.setattr(checks, "_required_checks", lambda _branch: ([], True))
+    monkeypatch.setattr(checks, "_required_checks_for_ref", lambda _branch: ([], True))
     monkeypatch.setattr(checks.time, "monotonic", spy_time([0, 1, 2, 11]))
     sleep = spy()
     monkeypatch.setattr(checks.time, "sleep", sleep)
@@ -689,7 +710,9 @@ def test_wait_for_checks_green_returns_terminal_check_states(
     monkeypatch, check_records, were_required, expected
 ):
     monkeypatch.setattr(
-        checks, "_required_checks", lambda _branch: (check_records, were_required)
+        checks,
+        "_required_checks_for_ref",
+        lambda _branch: (check_records, were_required),
     )
 
     assert checks._wait_for_required_checks_green(
@@ -704,7 +727,7 @@ def test_wait_for_checks_green_waits_for_pending_checks(monkeypatch, spy):
     passing = [{"name": "unit", "bucket": "pass"}]
     monkeypatch.setattr(
         checks,
-        "_required_checks",
+        "_required_checks_for_ref",
         spy(side_effect=[(pending, True), (passing, True)]),
     )
     sleep = spy()
@@ -724,7 +747,7 @@ def test_wait_for_checks_green_accepts_passing_optional_checks_after_grace(
     optional = [{"name": "lint", "bucket": "pass"}]
     monkeypatch.setattr(
         checks,
-        "_required_checks",
+        "_required_checks_for_ref",
         spy(return_value=(optional, False)),
     )
     monkeypatch.setattr(checks.time, "monotonic", spy_time([0, 6]))
@@ -746,7 +769,7 @@ def test_wait_for_checks_green_waits_for_required_after_optional_checks_pass(
     optional = [{"name": "lint", "bucket": "pass"}]
     required = [{"name": "unit", "bucket": "pass"}]
     required_checks = spy(side_effect=[(optional, False), (required, True)])
-    monkeypatch.setattr(checks, "_required_checks", required_checks)
+    monkeypatch.setattr(checks, "_required_checks_for_ref", required_checks)
     monkeypatch.setattr(checks.time, "monotonic", spy_time([0, 1, 1, 2]))
     sleep = spy()
     monkeypatch.setattr(checks.time, "sleep", sleep)
@@ -767,7 +790,7 @@ def test_wait_for_checks_green_succeeds_on_optional_checks_after_waiting_grace(
     required_checks = spy(return_value=(optional, False))
     monkeypatch.setattr(
         checks,
-        "_required_checks",
+        "_required_checks_for_ref",
         required_checks,
     )
     monkeypatch.setattr(checks.time, "monotonic", spy_time([0, 1, 1, 6]))
@@ -790,7 +813,7 @@ def test_wait_for_checks_green_caps_sleep_to_remaining_timeout(monkeypatch, spy)
     passing = [{"name": "unit", "bucket": "pass"}]
     monkeypatch.setattr(
         checks,
-        "_required_checks",
+        "_required_checks_for_ref",
         spy(side_effect=[(pending, True), (passing, True)]),
     )
     monkeypatch.setattr(checks.time, "monotonic", spy_time([0, 8, 8, 9]))
@@ -808,7 +831,7 @@ def test_wait_for_checks_green_caps_sleep_to_remaining_timeout(monkeypatch, spy)
 def test_wait_for_checks_green_times_out_while_checks_are_pending(monkeypatch):
     monkeypatch.setattr(
         checks,
-        "_required_checks",
+        "_required_checks_for_ref",
         lambda _branch: ([{"name": "unit", "bucket": "pending"}], True),
     )
     monkeypatch.setattr(checks.time, "monotonic", spy_time([0, 11]))

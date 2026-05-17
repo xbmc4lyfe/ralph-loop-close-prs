@@ -722,6 +722,30 @@ def test_merge_pr_skips_branch_delete_for_fork_prs(
     assert gh_run.call_count == 1
 
 
+def test_merge_pr_treats_branch_delete_failure_as_nonfatal(
+    monkeypatch, spy, completed_process
+):
+    monkeypatch.setattr(gh_ops, "_git_head_sha", lambda: "abc")
+    monkeypatch.setattr(gh_ops, "_ensure_pr_head_matches_local", lambda *a: None)
+    monkeypatch.setattr(gh_ops, "_sign_off_pr", lambda *a, **k: None)
+    monkeypatch.setattr(
+        gh_ops,
+        "_pr_view",
+        lambda _ref: {"headRefName": "feature", "isCrossRepository": False},
+    )
+    gh_run = spy(
+        side_effect=[
+            completed_process(returncode=0),
+            completed_process(returncode=1, stderr="protected branch"),
+        ]
+    )
+    monkeypatch.setattr(gh_ops, "_gh_run_with_retry", gh_run)
+
+    gh_ops._merge_pr("12")
+
+    assert gh_run.call_count == 2
+
+
 def test_truthy_and_ssh_public_key_detection():
     assert identity._is_truthy("YES") is True
     assert identity._is_truthy("no") is False

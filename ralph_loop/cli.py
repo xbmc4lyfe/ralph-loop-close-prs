@@ -10,6 +10,8 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from .checks import _wait_for_required_checks_green
@@ -39,9 +41,9 @@ from .git_ops import (
     _working_tree_dirty,
 )
 from .identity import _ensure_runtime_identity, _validate_identity_and_signing
-from .process import _print_step, _set_command_deadline
-from .quality import _commit_and_push
-from .runtime import _check_wall_clock, _round_numbers
+from .process import _configure_json_log, _print_step, _set_command_deadline
+from .quality import LocalQualityTelemetry, _commit_and_push
+from .runtime import _check_wall_clock
 from .worktrees import (
     _acquire_loop_lock,
     _cleanup_stale_loop_state,
@@ -54,6 +56,56 @@ def _write_stderr_fd(message: str):
         os.write(2, message.encode("utf-8", errors="replace"))
     except OSError:
         pass
+
+
+@dataclass
+class _RunTelemetry:
+    started_at: float
+    review_rounds: int = 0
+    ci_waits: int = 0
+    ci_repair_rounds: int = 0
+    local_quality_repair_rounds: int = 0
+    phase_seconds: Dict[str, float] = field(default_factory=dict)
+
+    @contextmanager
+    def phase(self, name: str):
+        phase_started = time.monotonic()
+        try:
+            yield
+        finally:
+            elapsed = time.monotonic() - phase_started
+            self.phase_seconds[name] = self.phase_seconds.get(name, 0.0) + elapsed
+
+    def record_local_quality(self, local: LocalQualityTelemetry) -> None:
+        self.local_quality_repair_rounds += local.repair_rounds
+
+    def emit(self) -> None:
+        total_seconds = time.monotonic() - self.started_at
+        review_seconds = self.phase_seconds.get("review", 0.0)
+        ci_seconds = self.phase_seconds.get("ci", 0.0)
+        _print_step(
+            "Telemetry review_rounds={review_rounds} ci_waits={ci_waits} "
+            "ci_repair_rounds={ci_repair_rounds} "
+            "local_quality_repair_rounds={local_quality_repair_rounds} "
+            "review_seconds={review_seconds:.2f} ci_seconds={ci_seconds:.2f} "
+            "total_seconds={total_seconds:.2f}".format(
+                review_rounds=self.review_rounds,
+                ci_waits=self.ci_waits,
+                ci_repair_rounds=self.ci_repair_rounds,
+                local_quality_repair_rounds=self.local_quality_repair_rounds,
+                review_seconds=review_seconds,
+                ci_seconds=ci_seconds,
+                total_seconds=total_seconds,
+            ),
+            event="run.telemetry",
+            review_rounds=self.review_rounds,
+            ci_waits=self.ci_waits,
+            ci_repair_rounds=self.ci_repair_rounds,
+            local_quality_repair_rounds=self.local_quality_repair_rounds,
+            review_seconds=round(review_seconds, 2),
+            ci_seconds=round(ci_seconds, 2),
+            total_seconds=round(total_seconds, 2),
+        )
 
 
 def _nonneg_int(value: str) -> int:
@@ -168,6 +220,11 @@ def _parse_args() -> argparse.Namespace:
             "subprocesses, and required-check polling. Use 0 for unlimited "
             "(the default)."
         ),
+    )
+    parser.add_argument(
+        "--json-log",
+        default=None,
+        help="Append structured JSON-lines events to this path.",
     )
     parser.add_argument(
         "--all-prs",
@@ -311,13 +368,75 @@ def _run_dry_run(args: argparse.Namespace) -> int:
     _print_step(
         "Dry run: validated PR #{} {} on branch '{}' targeting base '{}'.".format(
             pr_number, pr_data.get("url", ""), branch, args.base
-        )
+        ),
+        event="dry_run.validated_pr",
+        pr=pr_number,
+        url=pr_data.get("url", ""),
+        branch=branch,
+        base=args.base,
     )
+    _print_dry_run_simulation(args, pr_number, branch)
     _print_step(
         "Dry run: stopped before identity changes, worktree setup, Codex, "
-        "quality gates, rebase, push, reset, approval, merge, or branch deletion."
+        "quality gates, rebase, push, reset, approval, merge, or branch deletion.",
+        event="dry_run.stopped_before_mutation",
+        pr=pr_number,
+        mutates=False,
     )
     return 0
+
+
+def _dry_run_simulation_steps(
+    args: argparse.Namespace, pr_number: int, branch: str
+) -> List[str]:
+    steps = [
+        "would validate runtime identity and signing configuration",
+        "would acquire per-PR lock for PR #{}".format(pr_number),
+        "would create or reuse isolated worktree for branch '{}'".format(branch),
+        "would mark PR #{} as needing review and run Codex review rounds".format(
+            pr_number
+        ),
+        "would run local quality gates and push generated commits to '{}'".format(
+            branch
+        ),
+        "would wait for required checks on PR #{} and run CI repair rounds".format(
+            pr_number
+        ),
+    ]
+    if not args.skip_rebase:
+        steps.insert(
+            3,
+            "would rebase '{}' onto origin/{} before and after repairs".format(
+                branch, args.base
+            ),
+        )
+    if args.skip_merge:
+        steps.append("would stop before approval, merge, or branch deletion")
+    else:
+        steps.append("would approve and merge PR #{}".format(pr_number))
+        steps.append("would delete the same-repository remote branch if merge succeeds")
+    return steps
+
+
+def _print_dry_run_simulation(
+    args: argparse.Namespace, pr_number: int, branch: str
+) -> None:
+    _print_step(
+        "Dry run simulation plan:",
+        event="dry_run.simulation_start",
+        pr=pr_number,
+    )
+    for index, step in enumerate(
+        _dry_run_simulation_steps(args, pr_number, branch), start=1
+    ):
+        _print_step(
+            "Dry run: {}".format(step),
+            event="dry_run.simulation_step",
+            pr=pr_number,
+            step=index,
+            action=step,
+            mutates=False,
+        )
 
 
 def _passthrough_args(argv: List[str]) -> List[str]:
@@ -861,6 +980,7 @@ def main() -> int:
     original_cwd = os.getcwd()
     script_path = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
     args = _parse_args()
+    previous_json_log = _configure_json_log(args.json_log)
     raw_dirs = args.directory or []
     target_dirs = (
         _resolve_target_directories(raw_dirs, args.recursive)
@@ -874,9 +994,12 @@ def main() -> int:
                     sys.argv[0] if sys.argv else ""
                 )
             )
-        return _fan_out_across_directories(
-            args, sys.argv, script_path, target_dirs, original_cwd
-        )
+        try:
+            return _fan_out_across_directories(
+                args, sys.argv, script_path, target_dirs, original_cwd
+            )
+        finally:
+            _configure_json_log(previous_json_log)
     if target_dirs:
         target_dir = target_dirs[0]
         if not os.path.isdir(target_dir):
@@ -903,11 +1026,13 @@ def main() -> int:
         try:
             return _fan_out_all_prs(args, sys.argv, script_path)
         finally:
+            _configure_json_log(previous_json_log)
             try:
                 os.chdir(original_cwd)
             except OSError:
                 pass
     start_time = time.monotonic()
+    telemetry = _RunTelemetry(started_at=start_time)
     deadline: Optional[float] = (
         start_time + args.max_wall_clock_seconds
         if args.max_wall_clock_seconds > 0
@@ -929,22 +1054,26 @@ def main() -> int:
 
     pr_loop_lock = None
     try:
-        try:
-            pr_data, pr_number = _resolve_pr_data(args)
-        except CommandError as exc:
-            if not args.dry_run and "Could not resolve PR number" not in str(exc):
-                _ensure_runtime_identity()
-            raise
+        pr_data, pr_number = _resolve_pr_data(args)
         branch = _validate_pr_metadata(pr_data, pr_number, args.base)
         if args.dry_run:
             _print_step(
                 "Dry run: validated PR #{} {} on branch '{}' targeting base '{}'.".format(
                     pr_number, pr_data.get("url", ""), branch, args.base
-                )
+                ),
+                event="dry_run.validated_pr",
+                pr=pr_number,
+                url=pr_data.get("url", ""),
+                branch=branch,
+                base=args.base,
             )
+            _print_dry_run_simulation(args, pr_number, branch)
             _print_step(
                 "Dry run: stopped before identity changes, worktree setup, Codex, "
-                "quality gates, rebase, push, reset, approval, merge, or branch deletion."
+                "quality gates, rebase, push, reset, approval, merge, or branch deletion.",
+                event="dry_run.stopped_before_mutation",
+                pr=pr_number,
+                mutates=False,
             )
             return 0
         _ensure_runtime_identity()
@@ -975,45 +1104,88 @@ def main() -> int:
             _print_step("Initial rebase before review/fix loop")
             _rebase_onto_base(branch, args.base)
 
-        review_passed = False
-        last_review_round = 0
-        for round_number in _round_numbers(args.max_review_rounds):
-            _check_wall_clock(deadline)
-            last_review_round = round_number
-            pre_round_sha = _git_head_sha()
-            try:
-                external_comments = _pr_review_comments(pr_target)
-            except CommandError as exc:
-                _print_step(
-                    "Could not fetch existing PR review comments ({}); "
-                    "proceeding without them.".format(exc)
-                )
-                external_comments = []
-            if external_comments:
-                _print_step(
-                    "Surfacing {} existing PR review comment(s) to Codex.".format(
-                        len(external_comments)
+        with telemetry.phase("review"):
+            review_passed = False
+            last_review_round = 0
+            round_number = 0
+            while True:
+                round_number += 1
+                if args.max_review_rounds > 0 and round_number > args.max_review_rounds:
+                    break
+                telemetry.review_rounds += 1
+                _check_wall_clock(deadline)
+                last_review_round = round_number
+                pre_round_sha = _git_head_sha()
+                try:
+                    external_comments = _pr_review_comments(pr_target)
+                except CommandError as exc:
+                    _print_step(
+                        "Could not fetch existing PR review comments ({}); "
+                        "proceeding without them.".format(exc)
                     )
+                    external_comments = []
+                if external_comments:
+                    _print_step(
+                        "Surfacing {} existing PR review comment(s) to Codex.".format(
+                            len(external_comments)
+                        )
+                    )
+                review_passed, addressed = _run_review_fix_round(
+                    round_number,
+                    args.base,
+                    args.model,
+                    external_comments=external_comments,
                 )
-            review_passed, addressed = _run_review_fix_round(
-                round_number,
-                args.base,
-                args.model,
-                external_comments=external_comments,
-            )
-            if not review_passed:
+                if not review_passed:
+                    local_telemetry = LocalQualityTelemetry()
+                    commit_state = _commit_and_push(
+                        "review round {}".format(round_number),
+                        branch,
+                        base=args.base,
+                        model=args.model,
+                        require_review_gate=False,
+                        review_gate_after_quality_fix=False,
+                        max_local_quality_rounds=args.max_local_quality_rounds,
+                        pre_round_sha=pre_round_sha,
+                        deadline=deadline,
+                        telemetry=local_telemetry,
+                    )
+                    telemetry.record_local_quality(local_telemetry)
+                    if commit_state == "discarded":
+                        _print_step(
+                            "Review round {} changes were not useful; retrying with a fresh context window and Codex session.".format(
+                                round_number
+                            )
+                        )
+                        continue
+                    if commit_state == "no_changes":
+                        _reset_generated_changes(pre_round_sha)
+                    else:
+                        _post_addressed_comment_replies(
+                            pr_target, addressed, round_number
+                        )
+                    _print_step(
+                        "Review round {} still has actionable findings; retrying with a fresh context window and Codex session.".format(
+                            round_number
+                        )
+                    )
+                    continue
+                local_telemetry = LocalQualityTelemetry()
                 commit_state = _commit_and_push(
                     "review round {}".format(round_number),
                     branch,
                     base=args.base,
                     model=args.model,
                     require_review_gate=False,
-                    review_gate_after_quality_fix=False,
+                    review_gate_after_quality_fix=True,
                     max_local_quality_rounds=args.max_local_quality_rounds,
                     pre_round_sha=pre_round_sha,
                     deadline=deadline,
+                    telemetry=local_telemetry,
                 )
+                telemetry.record_local_quality(local_telemetry)
                 if commit_state == "discarded":
+                    review_passed = False
                     _print_step(
                         "Review round {} changes were not useful; retrying with a fresh context window and Codex session.".format(
                             round_number
@@ -1021,43 +1193,14 @@ def main() -> int:
                     )
                     continue
                 if commit_state == "no_changes":
-                    _reset_generated_changes(pre_round_sha)
+                    _print_step(
+                        "Review round {} passed with no file changes to commit.".format(
+                            round_number
+                        )
+                    )
                 else:
                     _post_addressed_comment_replies(pr_target, addressed, round_number)
-                _print_step(
-                    "Review round {} still has actionable findings; retrying with a fresh context window and Codex session.".format(
-                        round_number
-                    )
-                )
-                continue
-            commit_state = _commit_and_push(
-                "review round {}".format(round_number),
-                branch,
-                base=args.base,
-                model=args.model,
-                require_review_gate=False,
-                review_gate_after_quality_fix=True,
-                max_local_quality_rounds=args.max_local_quality_rounds,
-                pre_round_sha=pre_round_sha,
-                deadline=deadline,
-            )
-            if commit_state == "discarded":
-                review_passed = False
-                _print_step(
-                    "Review round {} changes were not useful; retrying with a fresh context window and Codex session.".format(
-                        round_number
-                    )
-                )
-                continue
-            if commit_state == "no_changes":
-                _print_step(
-                    "Review round {} passed with no file changes to commit.".format(
-                        round_number
-                    )
-                )
-            else:
-                _post_addressed_comment_replies(pr_target, addressed, round_number)
-            break
+                break
         if not review_passed:
             if args.max_review_rounds > 0:
                 raise CommandError(
@@ -1071,66 +1214,79 @@ def main() -> int:
                 )
             )
 
-        ci_green = False
-        last_ci_round = 0
-        for round_number in _round_numbers(args.max_ci_rounds):
-            _check_wall_clock(deadline)
-            last_ci_round = round_number
-            ci_green, checks = _wait_for_required_checks_green(
-                branch=branch,
-                poll_seconds=args.poll_seconds,
-                timeout_seconds=args.checks_timeout_seconds,
-                deadline=deadline,
-            )
-            if ci_green:
-                break
-            pre_round_sha = _git_head_sha()
-            ready = _run_ci_fix_round(
-                round_number=round_number,
-                checks=checks,
-                model=args.model,
-            )
-            if not ready:
-                _reset_generated_changes(pre_round_sha)
-                _print_step(
-                    "CI round {} did not produce a useful fix; retrying with a fresh context window and Codex session.".format(
-                        round_number
-                    )
+        with telemetry.phase("ci"):
+            ci_green = False
+            last_ci_round = 0
+            round_number = 0
+            while True:
+                round_number += 1
+                if args.max_ci_rounds > 0 and round_number > args.max_ci_rounds:
+                    break
+                _check_wall_clock(deadline)
+                last_ci_round = round_number
+                telemetry.ci_waits += 1
+                ci_green, checks = _wait_for_required_checks_green(
+                    branch=branch,
+                    pr_number=pr_number,
+                    poll_seconds=args.poll_seconds,
+                    timeout_seconds=args.checks_timeout_seconds,
+                    deadline=deadline,
                 )
-                continue
-            commit_state = _commit_and_push(
-                "ci round {}".format(round_number),
-                branch,
-                base=args.base,
-                model=args.model,
-                require_review_gate=True,
-                review_gate_after_quality_fix=True,
-                max_local_quality_rounds=args.max_local_quality_rounds,
-                pre_round_sha=pre_round_sha,
-                deadline=deadline,
-            )
-            if commit_state == "discarded":
-                _print_step(
-                    "CI round {} changes were not useful; retrying with a fresh context window and Codex session.".format(
-                        round_number
-                    )
+                if ci_green:
+                    break
+                pre_round_sha = _git_head_sha()
+                telemetry.ci_repair_rounds += 1
+                ready = _run_ci_fix_round(
+                    round_number=round_number,
+                    checks=checks,
+                    model=args.model,
                 )
-                continue
-            if commit_state == "no_changes":
-                _print_step(
-                    "CI round {} produced no file changes; retrying with a fresh context window and Codex session.".format(
-                        round_number
+                if not ready:
+                    _reset_generated_changes(pre_round_sha)
+                    _print_step(
+                        "CI round {} did not produce a useful fix; retrying with a fresh context window and Codex session.".format(
+                            round_number
+                        )
                     )
+                    continue
+                local_telemetry = LocalQualityTelemetry()
+                commit_state = _commit_and_push(
+                    "ci round {}".format(round_number),
+                    branch,
+                    base=args.base,
+                    model=args.model,
+                    require_review_gate=True,
+                    review_gate_after_quality_fix=True,
+                    max_local_quality_rounds=args.max_local_quality_rounds,
+                    pre_round_sha=pre_round_sha,
+                    deadline=deadline,
+                    telemetry=local_telemetry,
                 )
-                continue
-            ci_green, checks = _wait_for_required_checks_green(
-                branch=branch,
-                poll_seconds=args.poll_seconds,
-                timeout_seconds=args.checks_timeout_seconds,
-                deadline=deadline,
-            )
-            if ci_green:
-                break
+                telemetry.record_local_quality(local_telemetry)
+                if commit_state == "discarded":
+                    _print_step(
+                        "CI round {} changes were not useful; retrying with a fresh context window and Codex session.".format(
+                            round_number
+                        )
+                    )
+                    continue
+                if commit_state == "no_changes":
+                    _print_step(
+                        "CI round {} produced no file changes; retrying with a fresh context window and Codex session.".format(
+                            round_number
+                        )
+                    )
+                    continue
+                telemetry.ci_waits += 1
+                ci_green, checks = _wait_for_required_checks_green(
+                    branch=branch,
+                    pr_number=pr_number,
+                    poll_seconds=args.poll_seconds,
+                    timeout_seconds=args.checks_timeout_seconds,
+                    deadline=deadline,
+                )
+                if ci_green:
+                    break
         if not ci_green:
             if args.max_ci_rounds > 0:
                 raise CommandError(
@@ -1148,6 +1304,7 @@ def main() -> int:
             _rebase_onto_base(branch, args.base)
             ci_green_after_rebase, _ = _wait_for_required_checks_green(
                 branch=branch,
+                pr_number=pr_number,
                 poll_seconds=args.poll_seconds,
                 timeout_seconds=args.checks_timeout_seconds,
                 deadline=deadline,
@@ -1168,7 +1325,8 @@ def main() -> int:
                 )
             _prepare_pr_for_merge(str(pr_number))
             _merge_pr(pr_target)
-        _print_step("Done.")
+        telemetry.emit()
+        _print_step("Done.", event="run.done")
         return 0
     except CodexEnvironmentError as exc:
         sys.stderr.write(
@@ -1182,6 +1340,7 @@ def main() -> int:
         return CODEX_ENV_FAILURE_EXIT_CODE
     finally:
         _set_command_deadline(previous_command_deadline)
+        _configure_json_log(previous_json_log)
         if pr_loop_lock is not None:
             pr_loop_lock.release()
         try:

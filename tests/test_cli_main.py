@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import runpy
 import signal
@@ -7,7 +8,7 @@ import sys
 
 import pytest
 
-from ralph_loop import cli
+from ralph_loop import cli, runtime
 from ralph_loop.errors import (
     CODEX_ENV_FAILURE_EXIT_CODE,
     CodexEnvironmentError,
@@ -54,6 +55,8 @@ def test_parse_args_defaults_and_explicit_options(monkeypatch):
             "/tmp/root",
             "--max-wall-clock-seconds",
             "7",
+            "--json-log",
+            "/tmp/ralph.jsonl",
         ],
     )
 
@@ -72,6 +75,7 @@ def test_parse_args_defaults_and_explicit_options(monkeypatch):
     assert args.dry_run is True
     assert args.worktree_root == "/tmp/root"
     assert args.max_wall_clock_seconds == 7
+    assert args.json_log == "/tmp/ralph.jsonl"
 
 
 @pytest.mark.parametrize(
@@ -131,6 +135,55 @@ def test_main_installs_and_restores_global_command_deadline(
     assert harness.commit_push.call_args.kwargs["deadline"] == 130.0
 
 
+def test_main_passes_pr_number_to_check_waits(cli_harness):
+    harness = cli_harness()
+
+    assert cli.main() == 0
+
+    harness.wait_checks.assert_called_once()
+    assert harness.wait_checks.call_args.kwargs["branch"] == "feature"
+    assert harness.wait_checks.call_args.kwargs["pr_number"] == 7
+
+
+def test_main_emits_phase_and_round_telemetry(monkeypatch, cli_harness, capsys):
+    harness = cli_harness()
+    harness.commit_push.return_value = "committed"
+    harness.wait_checks.return_value = (True, [{"name": "unit", "bucket": "pass"}])
+    tick_values = iter(
+        [
+            10.0,  # main start
+            11.0,  # review phase start
+            12.5,  # review phase finish
+            13.0,  # ci phase start
+            15.25,  # ci phase finish
+            16.0,  # total finish
+        ]
+    )
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(tick_values))
+
+    assert cli.main() == 0
+
+    stderr = capsys.readouterr().err
+    assert "Telemetry review_rounds=1" in stderr
+    assert "ci_waits=1" in stderr
+    assert "ci_repair_rounds=0" in stderr
+    assert "review_seconds=1.50" in stderr
+    assert "ci_seconds=2.25" in stderr
+    assert "total_seconds=6.00" in stderr
+
+
+def test_main_does_not_use_round_numbers_helper(monkeypatch, cli_harness):
+    cli_harness()
+
+    def fail_round_numbers(_max_rounds):
+        raise AssertionError("_round_numbers should not be used by main")
+
+    monkeypatch.setattr(cli, "_round_numbers", fail_round_numbers, raising=False)
+    monkeypatch.setattr(runtime, "_round_numbers", fail_round_numbers, raising=False)
+
+    assert cli.main() == 0
+
+
 def test_main_happy_path_with_rebase_and_merge(cli_harness, cli_args):
     harness = cli_harness(args=cli_args(skip_rebase=False, skip_merge=False))
 
@@ -173,6 +226,18 @@ def test_main_rejects_numeric_current_branch_without_explicit_pr(
     harness.pr_view.assert_not_called()
 
 
+def test_main_does_not_mutate_identity_when_pr_lookup_fails(cli_harness, cli_args):
+    harness = cli_harness(args=cli_args(pr=12))
+    harness.pr_view.side_effect = CommandError("permission denied")
+
+    with pytest.raises(CommandError, match="permission denied"):
+        cli.main()
+
+    harness.ensure_identity.assert_not_called()
+    harness.acquire_lock.assert_not_called()
+    harness.ensure_worktree.assert_not_called()
+
+
 def test_main_rejects_fork_pr_before_mutating_state(cli_harness, cli_args):
     harness = cli_harness(
         args=cli_args(pr=94),
@@ -207,6 +272,9 @@ def test_main_dry_run_validates_pr_without_mutating_local_or_remote_state(
 
     stderr = capsys.readouterr().err
     assert "Dry run: validated PR #7" in stderr
+    assert "Dry run simulation plan:" in stderr
+    assert "would acquire per-PR lock for PR #7" in stderr
+    assert "would approve and merge PR #7" in stderr
     assert "stopped before identity changes" in stderr
     harness.git_branch.assert_not_called()
     harness.pr_view.assert_called_once_with("7")
@@ -225,6 +293,58 @@ def test_main_dry_run_validates_pr_without_mutating_local_or_remote_state(
     harness.prepare_merge.assert_not_called()
     harness.merge_pr.assert_not_called()
     harness.lock.release.assert_not_called()
+
+
+def test_main_writes_json_log_for_dry_run(cli_harness, cli_args, tmp_path):
+    log_path = tmp_path / "ralph.jsonl"
+    args = cli_args(
+        dry_run=True,
+        skip_rebase=False,
+        skip_merge=False,
+        json_log=str(log_path),
+    )
+    cli_harness(args=args)
+
+    assert cli.main() == 0
+
+    events = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["event"] for event in events] == [
+        "dry_run.validated_pr",
+        "dry_run.simulation_start",
+        "dry_run.simulation_step",
+        "dry_run.simulation_step",
+        "dry_run.simulation_step",
+        "dry_run.simulation_step",
+        "dry_run.simulation_step",
+        "dry_run.simulation_step",
+        "dry_run.simulation_step",
+        "dry_run.simulation_step",
+        "dry_run.simulation_step",
+        "dry_run.stopped_before_mutation",
+    ]
+    assert events[0]["pr"] == 7
+    assert events[0]["branch"] == "feature"
+    assert events[-1]["mutates"] is False
+
+
+def test_main_merge_path_emits_json_telemetry(cli_harness, cli_args, tmp_path):
+    log_path = tmp_path / "ralph.jsonl"
+    harness = cli_harness(
+        args=cli_args(skip_rebase=True, skip_merge=False, json_log=str(log_path))
+    )
+
+    assert cli.main() == 0
+
+    harness.prepare_merge.assert_called_once_with("7")
+    harness.merge_pr.assert_called_once_with("7")
+    events = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(event["event"] == "run.telemetry" for event in events)
+    assert events[-2]["event"] == "run.telemetry"
+    assert events[-1]["event"] == "run.done"
 
 
 def test_main_signal_handler_exits_with_shell_status(
@@ -386,6 +506,34 @@ def test_main_revalidates_pr_metadata_before_merge(cli_harness, cli_args, pr_dat
 
     harness.prepare_merge.assert_not_called()
     harness.merge_pr.assert_not_called()
+
+
+def test_main_merge_path_orders_revalidation_prepare_and_merge(
+    cli_harness, cli_args, pr_data
+):
+    harness = cli_harness(args=cli_args(skip_rebase=True, skip_merge=False))
+    call_order: List[str] = []
+    harness.pr_view.side_effect = lambda _ref: call_order.append("pr_view") or pr_data()
+    harness.prepare_merge.side_effect = lambda _ref: call_order.append("prepare")
+    harness.merge_pr.side_effect = lambda _ref: call_order.append("merge")
+
+    assert cli.main() == 0
+
+    assert call_order == ["pr_view", "pr_view", "prepare", "merge"]
+
+
+def test_main_final_rebase_rechecks_pr_checks_before_merge(
+    cli_harness, cli_args
+):
+    harness = cli_harness(args=cli_args(skip_rebase=False, skip_merge=False))
+
+    assert cli.main() == 0
+
+    assert harness.rebase.call_count == 2
+    assert harness.wait_checks.call_count == 2
+    assert harness.wait_checks.call_args_list[-1].kwargs["pr_number"] == 7
+    harness.prepare_merge.assert_called_once_with("7")
+    harness.merge_pr.assert_called_once_with("7")
 
 
 def test_main_final_rebase_requires_green_checks(cli_harness, cli_args):

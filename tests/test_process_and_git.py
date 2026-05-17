@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 
@@ -41,6 +42,36 @@ def test_print_step_writes_timestamped_stderr_line(monkeypatch, capsys):
     process._print_step("hello")
 
     assert capsys.readouterr().err == "\n[12:34:56] ==> hello\n"
+
+
+def test_print_step_appends_structured_json_event(monkeypatch, tmp_path, capsys):
+    class FakeDateTime:
+        @classmethod
+        def now(cls):
+            return cls()
+
+        def strftime(self, _fmt):
+            return "12:34:56"
+
+        def isoformat(self, timespec="seconds"):
+            assert timespec == "seconds"
+            return "2026-05-17T12:34:56"
+
+    log_path = tmp_path / "ralph.jsonl"
+    monkeypatch.setattr(process.datetime, "datetime", FakeDateTime)
+    process._configure_json_log(str(log_path))
+    try:
+        process._print_step("hello", event="unit.test", answer=42)
+    finally:
+        process._configure_json_log(None)
+
+    assert capsys.readouterr().err == "\n[12:34:56] ==> hello\n"
+    assert json.loads(log_path.read_text(encoding="utf-8")) == {
+        "answer": 42,
+        "event": "unit.test",
+        "message": "hello",
+        "timestamp": "2026-05-17T12:34:56",
+    }
 
 
 def test_run_command_captures_and_replays_output(capsys):

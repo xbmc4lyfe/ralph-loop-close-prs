@@ -50,9 +50,21 @@ def _acquire_loop_lock(
     lock_path = os.path.join(
         tempfile.gettempdir(), "codex-ralph-loop-{}.lock".format(key)
     )
+    open_flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        open_flags |= os.O_NOFOLLOW
     if os.path.islink(lock_path):
-        raise CommandError("Refusing to use symlink as Ralph lock file: {}".format(lock_path))
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        raise CommandError(
+            "Refusing to use symlink as Ralph lock file: {}".format(lock_path)
+        )
+    try:
+        fd = os.open(lock_path, open_flags, 0o644)
+    except OSError as exc:
+        if os.path.islink(lock_path):
+            raise CommandError(
+                "Refusing to use symlink as Ralph lock file: {}".format(lock_path)
+            ) from exc
+        raise
     handle = os.fdopen(fd, "r+", encoding="utf-8")
     try:
         try:

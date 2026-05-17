@@ -2,25 +2,34 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import shlex
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from .errors import CommandError
 
 MAX_CAPTURED_STREAM_BYTES = 1 << 20
 _COMMAND_DEADLINE: Optional[float] = None
 _DEFAULT_OUTPUT_LIMIT = object()
+_JSON_LOG_PATH: Optional[str] = None
 
 
 def _set_command_deadline(deadline: Optional[float]) -> Optional[float]:
     global _COMMAND_DEADLINE
     previous = _COMMAND_DEADLINE
     _COMMAND_DEADLINE = deadline
+    return previous
+
+
+def _configure_json_log(path: Optional[str]) -> Optional[str]:
+    global _JSON_LOG_PATH
+    previous = _JSON_LOG_PATH
+    _JSON_LOG_PATH = path
     return previous
 
 
@@ -61,10 +70,30 @@ def _read_bounded_output(handle, limit: Optional[int] = MAX_CAPTURED_STREAM_BYTE
     )
 
 
-def _print_step(message: str):
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+def _append_json_event(record: Dict[str, Any]) -> None:
+    if not _JSON_LOG_PATH:
+        return
+    directory = os.path.dirname(os.path.abspath(_JSON_LOG_PATH))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(_JSON_LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def _print_step(message: str, event: str = "step", **fields: Any) -> None:
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%H:%M:%S")
     sys.stderr.write("\n[{}] ==> {}\n".format(timestamp, message))
     sys.stderr.flush()
+    if not _JSON_LOG_PATH:
+        return
+    record = {
+        "event": event,
+        "message": message,
+        "timestamp": now.isoformat(timespec="seconds"),
+    }
+    record.update(fields)
+    _append_json_event(record)
 
 
 def _printable_cmd(cmd: Sequence[str], *, max_arg_len: int = 4000) -> str:

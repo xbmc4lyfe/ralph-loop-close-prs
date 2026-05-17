@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from .codex_agent import _run_local_quality_fix_round, _run_pre_push_review_gate
@@ -35,6 +36,11 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)(token=)[^\s&]+"),
     re.compile(r"(?i)(password=)[^\s&]+"),
 )
+
+
+@dataclass
+class LocalQualityTelemetry:
+    repair_rounds: int = 0
 
 
 def _redact_for_prompt(text: str) -> str:
@@ -138,6 +144,7 @@ def _commit_and_push(
     max_local_quality_rounds: int,
     pre_round_sha: Optional[str] = None,
     deadline: Optional[float] = None,
+    telemetry: Optional[LocalQualityTelemetry] = None,
 ) -> str:
     local_quality_round = 0
     review_gate_needed = require_review_gate
@@ -179,6 +186,8 @@ def _commit_and_push(
                 )
             )
         local_quality_round += 1
+        if telemetry is not None:
+            telemetry.repair_rounds += 1
         _check_wall_clock(deadline)
         ready = _run_local_quality_fix_round(
             round_number=local_quality_round,
