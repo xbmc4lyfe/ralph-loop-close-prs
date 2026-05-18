@@ -7,6 +7,7 @@ import re
 import shlex
 import signal
 import subprocess
+import concurrent.futures
 import sys
 import threading
 import time
@@ -543,24 +544,52 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
+    # Performance Optimization:
+    # Subprocess calls to `gh pr view` are a significant bottleneck.
+    # Checking PR states sequentially takes O(N) time.
+    # Using a ThreadPoolExecutor reduces this to O(N/workers) time by overlapping the CLI IO.
     kept: List[int] = []
+
+    if not pr_numbers:
+        return kept
+
+    max_workers = min(len(pr_numbers), 10)  # Max 10 concurrent gh CLI processes
+    results = {}
+
+    def check_pr(pr: int) -> bool:
+        return _pr_is_still_open(pr)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_pr = {executor.submit(check_pr, pr): pr for pr in pr_numbers}
+        for future in concurrent.futures.as_completed(future_to_pr):
+            pr = future_to_pr[future]
+            try:
+                still_open = future.result()
+                results[pr] = still_open
+            except CommandError as exc:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+                results[pr] = True # Default to keep on failure
+            except Exception as exc:
+                # Catch-all for safety
+                _print_step(
+                    "Unexpected error confirming PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+                results[pr] = True
+
+    # Maintain original order
     for pr in pr_numbers:
-        try:
-            still_open = _pr_is_still_open(pr)
-        except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
-            continue
-        if still_open:
+        if results[pr]:
             kept.append(pr)
         else:
             _print_step(
                 "PR #{} is no longer open (per gh pr view); skipping "
                 "fan-out spawn.".format(pr)
             )
+
     return kept
 
 

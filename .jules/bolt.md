@@ -1,0 +1,3 @@
+## 2024-05-18 - Use concurrent execution to prevent N+1 GitHub CLI bottlenecks
+**Learning:** Subprocess calls to the GitHub CLI (`gh`), such as `_gh_json` and `_gh_run_with_retry`, are extremely slow and represent a significant performance bottleneck. Running these sequentially over a collection of items (like a list of PR numbers) causes severe N+1 delays.
+**Action:** Always use concurrency (e.g., `concurrent.futures.ThreadPoolExecutor`) to fetch states from the `gh` CLI simultaneously when dealing with multiple items, capping the `max_workers` to a sensible value to prevent rate limiting or hitting connection limits.
