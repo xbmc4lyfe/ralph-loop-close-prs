@@ -1,0 +1,3 @@
+## 2024-05-18 - [Subprocess bottlenecks with GitHub CLI]
+**Learning:** Calling out to the GitHub CLI (`gh`) via subprocess (e.g. `_gh_json`, `_gh_run_with_retry`) has significant overhead. Calling it sequentially in a loop, such as iterating over a list of PRs to check their status with `_pr_is_still_open`, creates a major N+1 performance bottleneck that blocks the event loop/supervisor.
+**Action:** Use concurrency (like `concurrent.futures.ThreadPoolExecutor`) when making multiple independent subprocess calls to `gh`, to run them in parallel and reduce overall execution time. Maintain original sorting orders if required.
