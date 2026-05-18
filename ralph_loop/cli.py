@@ -520,7 +520,7 @@ def _spawn_child(
             time.strftime("%Y-%m-%d %H:%M:%S"), shlex.join(cmd)
         ).encode("utf-8", errors="replace")
     )
-    proc = subprocess.Popen(
+    proc = subprocess.Popen(  # nosec B603
         cmd,
         stdin=subprocess.DEVNULL,
         stdout=log_handle,
@@ -945,7 +945,7 @@ def _fan_out_across_directories(
         _print_step(
             "Launched repo supervisor for {} (log: {})".format(target_dir, log_path)
         )
-        proc = subprocess.Popen(
+        proc = subprocess.Popen(  # nosec B603
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
