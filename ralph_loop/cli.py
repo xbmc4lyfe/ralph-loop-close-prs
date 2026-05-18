@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import signal
+import concurrent.futures
 import subprocess
 import sys
 import threading
@@ -543,24 +544,35 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
+    # ⚡ Bolt Optimization: Checking open state uses a subprocess call to `gh` per PR.
+    # We use ThreadPoolExecutor to perform these checks concurrently and eliminate
+    # sequential N+1 delays, which dramatically speeds up the pre-filtering phase.
     kept: List[int] = []
-    for pr in pr_numbers:
+
+    def check_pr(pr: int) -> Tuple[int, bool, Optional[Exception]]:
         try:
-            still_open = _pr_is_still_open(pr)
+            return pr, _pr_is_still_open(pr), None
         except CommandError as exc:
+            return pr, True, exc
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(pr_numbers) if pr_numbers else 1)) as executor:
+        results = executor.map(check_pr, pr_numbers)
+
+    for pr, still_open, exc in results:
+        if exc is not None:
             _print_step(
                 "Could not confirm PR #{} open state ({}); keeping it in the "
                 "fan-out set.".format(pr, exc)
             )
             kept.append(pr)
-            continue
-        if still_open:
+        elif still_open:
             kept.append(pr)
         else:
             _print_step(
                 "PR #{} is no longer open (per gh pr view); skipping "
                 "fan-out spawn.".format(pr)
             )
+
     return kept
 
 
