@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import concurrent.futures
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -544,17 +545,31 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     swallow stale PRs because of a flaky network.
     """
     kept: List[int] = []
+    results = {}
+
+    # Use concurrency to avoid N+1 sequential subprocess execution delays
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_pr = {executor.submit(_pr_is_still_open, pr): pr for pr in pr_numbers}
+        for future in concurrent.futures.as_completed(future_to_pr):
+            pr = future_to_pr[future]
+            try:
+                results[pr] = future.result()
+            except CommandError as exc:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+                results[pr] = True
+            except Exception as exc:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+                results[pr] = True
+
+    # Maintain original order
     for pr in pr_numbers:
-        try:
-            still_open = _pr_is_still_open(pr)
-        except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
-            continue
-        if still_open:
+        if results.get(pr, True):
             kept.append(pr)
         else:
             _print_step(
