@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import concurrent.futures
 import time
 from dataclasses import dataclass, field
 from contextlib import contextmanager
@@ -543,18 +544,35 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
-    kept: List[int] = []
-    for pr in pr_numbers:
+    # ⚡ Bolt Optimization: Use ThreadPoolExecutor to check PRs concurrently.
+    # Impact: Reduces N+1 sequential delays from subprocess calls to the gh CLI.
+    # Measurement: The total time for this function decreases from O(N * latency) to O(N/workers * latency).
+
+    def check_pr(pr: int) -> Tuple[int, bool, Optional[Exception]]:
         try:
-            still_open = _pr_is_still_open(pr)
+            return pr, _pr_is_still_open(pr), None
         except CommandError as exc:
+            return pr, True, exc
+
+    results_map = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # Use executor.map or track order to preserve the original ordering of PR numbers
+        futures = {executor.submit(check_pr, pr): pr for pr in pr_numbers}
+        for future in concurrent.futures.as_completed(futures):
+            pr, still_open, exc = future.result()
+            results_map[pr] = (still_open, exc)
+
+    kept: List[int] = []
+    # Process results in the original PR order
+    for pr in pr_numbers:
+        still_open, exc = results_map[pr]
+        if exc:
             _print_step(
                 "Could not confirm PR #{} open state ({}); keeping it in the "
                 "fan-out set.".format(pr, exc)
             )
             kept.append(pr)
-            continue
-        if still_open:
+        elif still_open:
             kept.append(pr)
         else:
             _print_step(
