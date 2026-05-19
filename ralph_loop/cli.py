@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import re
 import shlex
@@ -529,6 +530,13 @@ def _spawn_child(
     return proc, log_path, log_handle
 
 
+def _check_pr_open_state(pr: int) -> Tuple[int, bool, Optional[Exception]]:
+    try:
+        return pr, _pr_is_still_open(pr), None
+    except CommandError as exc:
+        return pr, True, exc
+
+
 def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     """Drop PRs that are no longer OPEN/non-draft via a targeted gh pr view.
 
@@ -544,23 +552,28 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     swallow stale PRs because of a flaky network.
     """
     kept: List[int] = []
-    for pr in pr_numbers:
-        try:
-            still_open = _pr_is_still_open(pr)
-        except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
-            _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
-                "fan-out spawn.".format(pr)
-            )
+
+    # Use concurrency to avoid N+1 sequential execution delays for gh pr view
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
+        for pr in pr_numbers:
+            futures.append(executor.submit(_check_pr_open_state, pr))
+
+        for future in futures:
+            pr, still_open, exc = future.result()
+            if exc:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+                kept.append(pr)
+            elif still_open:
+                kept.append(pr)
+            else:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
     return kept
 
 
