@@ -360,6 +360,8 @@ def _validate_pr_metadata(
     branch = pr_data.get("headRefName")
     if not branch:
         raise CommandError("Could not resolve PR head branch.")
+    if expected_base.startswith("-") or branch.startswith("-"):
+        raise CommandError("Security: Branch names cannot start with a hyphen to prevent Git argument injection.")
     if branch == expected_base:
         raise CommandError(
             "PR head branch '{}' matches base '{}'; aborting.".format(
