@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import concurrent.futures
 import shlex
 import signal
 import subprocess
@@ -543,24 +544,31 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
-    kept: List[int] = []
-    for pr in pr_numbers:
+    # ⚡ Bolt Optimization: Use a thread pool to avoid N+1 `gh` call latency
+    # when processing a large number of candidate PRs.
+
+    def _check_pr(pr: int) -> Tuple[int, bool, Optional[Exception]]:
         try:
-            still_open = _pr_is_still_open(pr)
+            return pr, _pr_is_still_open(pr), None
         except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
-            _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
-                "fan-out spawn.".format(pr)
-            )
+            return pr, True, exc
+
+    kept: List[int] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for pr, still_open, exc in executor.map(_check_pr, pr_numbers):
+            if exc is not None:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+                kept.append(pr)
+            elif still_open:
+                kept.append(pr)
+            else:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
     return kept
 
 
