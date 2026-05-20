@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import concurrent.futures
 import re
 import shlex
 import signal
@@ -543,18 +544,34 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
+    # ⚡ Bolt: Fetch PR statuses concurrently. GitHub CLI subprocess calls are
+    # a significant bottleneck; this prevents N+1 sequential delays during fan-out.
     kept: List[int] = []
-    for pr in pr_numbers:
+
+    def _check_pr(pr: int) -> Tuple[int, bool, Optional[Exception]]:
         try:
-            still_open = _pr_is_still_open(pr)
-        except CommandError as exc:
+            return pr, _pr_is_still_open(pr), None
+        except Exception as exc:
+            return pr, True, exc
+
+    results: Dict[int, Tuple[bool, Optional[Exception]]] = {}
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(10, len(pr_numbers) or 1)
+    ) as executor:
+        future_to_pr = {executor.submit(_check_pr, pr): pr for pr in pr_numbers}
+        for future in concurrent.futures.as_completed(future_to_pr):
+            pr, still_open, exc = future.result()
+            results[pr] = (still_open, exc)
+
+    for pr in pr_numbers:
+        still_open, exc = results[pr]
+        if exc:
             _print_step(
                 "Could not confirm PR #{} open state ({}); keeping it in the "
                 "fan-out set.".format(pr, exc)
             )
             kept.append(pr)
-            continue
-        if still_open:
+        elif still_open:
             kept.append(pr)
         else:
             _print_step(
