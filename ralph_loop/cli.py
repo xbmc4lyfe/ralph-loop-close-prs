@@ -1,6 +1,7 @@
 """Command-line interface and top-level orchestration."""
 from __future__ import annotations
 
+import concurrent.futures
 import argparse
 import os
 import re
@@ -543,24 +544,31 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
-    kept: List[int] = []
-    for pr in pr_numbers:
+    # ⚡ Bolt Optimization: Use ThreadPoolExecutor to check PR statuses concurrently
+    # This avoids N+1 sequential delays from GitHub CLI subprocess calls.
+    def _check(pr: int) -> Tuple[int, bool, Optional[str]]:
         try:
-            still_open = _pr_is_still_open(pr)
+            return pr, _pr_is_still_open(pr), None
         except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
-            _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
-                "fan-out spawn.".format(pr)
-            )
+            return pr, True, str(exc)
+
+    kept: List[int] = []
+    # Use max 10 workers to avoid spawning too many processes concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(pr_numbers) or 1, 10)) as executor:
+        for pr, still_open, err in executor.map(_check, pr_numbers):
+            if err is not None:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, err)
+                )
+                kept.append(pr)
+            elif still_open:
+                kept.append(pr)
+            else:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
     return kept
 
 
