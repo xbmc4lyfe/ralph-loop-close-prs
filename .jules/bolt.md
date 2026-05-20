@@ -1,0 +1,3 @@
+## 2024-05-24 - [Concurrent PR status checking]
+**Learning:** Sequential subprocess calls to GitHub CLI (`gh`), like `_pr_is_still_open` via `gh pr view`, are a significant performance bottleneck when handling multiple PRs in a fan-out script due to high latency of repeated external process invocations and network IO.
+**Action:** Use `concurrent.futures.ThreadPoolExecutor` to check multiple PRs' states concurrently, drastically reducing N+1 delays by overlapping the network IO latency of these subprocesses.
