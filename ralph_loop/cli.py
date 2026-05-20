@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import re
 import shlex
@@ -544,24 +545,33 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     swallow stale PRs because of a flaky network.
     """
     kept: List[int] = []
-    for pr in pr_numbers:
-        try:
-            still_open = _pr_is_still_open(pr)
-        except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
-            _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
-                "fan-out spawn.".format(pr)
-            )
-    return kept
+
+    # Use a ThreadPoolExecutor to perform concurrency. We cap max_workers to avoid
+    # flooding GitHub API too aggressively, but enough to avoid N+1 delays.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_pr = {executor.submit(_pr_is_still_open, pr): pr for pr in pr_numbers}
+        for future in concurrent.futures.as_completed(future_to_pr):
+            pr = future_to_pr[future]
+            try:
+                still_open = future.result()
+            except CommandError as exc:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+                kept.append(pr)
+                continue
+
+            if still_open:
+                kept.append(pr)
+            else:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
+
+    # Sort the kept PRs so the ordering remains deterministic.
+    return sorted(kept)
 
 
 def _cleanup_source_origin() -> str:
