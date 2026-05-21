@@ -1,0 +1,3 @@
+## 2024-06-25 - [gh CLI Bottleneck Mitigation]
+**Learning:** Subprocess calls to the GitHub CLI (`gh`), specifically things like `gh pr view`, are a significant performance bottleneck due to startup latency. When executing sequentially inside loops (the N+1 query problem applied to CLI wrappers), it drastically slows down operations that process multiple pull requests.
+**Action:** Used `concurrent.futures.ThreadPoolExecutor` when performing `_pr_is_still_open` checks across multiple PRs simultaneously to avoid sequential execution delays. Maintain a small pool size (e.g. max_workers=10) to avoid overloading system resources or triggering rate-limits instantly, but still get substantial wall-clock speedups.
