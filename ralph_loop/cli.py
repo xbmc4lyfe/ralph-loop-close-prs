@@ -12,6 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from contextlib import contextmanager
+import concurrent.futures
 from typing import Any, Dict, List, Optional, Tuple
 
 from .checks import _wait_for_required_checks_green
@@ -542,25 +543,63 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     "keep this PR" — we only drop PRs that GitHub definitively reports as
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
+
+    Performance optimization: `gh pr view` calls are made concurrently
+    to avoid N+1 sequential execution delays.
     """
     kept: List[int] = []
-    for pr in pr_numbers:
+
+    # Fast path for empty list or single item
+    if not pr_numbers:
+        return []
+    if len(pr_numbers) == 1:
+        pr = pr_numbers[0]
         try:
-            still_open = _pr_is_still_open(pr)
+            if _pr_is_still_open(pr):
+                return [pr]
+            else:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
+                return []
         except CommandError as exc:
             _print_step(
                 "Could not confirm PR #{} open state ({}); keeping it in the "
                 "fan-out set.".format(pr, exc)
             )
+            return [pr]
+
+    # Map PR numbers to futures to maintain order
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(pr_numbers))) as executor:
+        future_to_pr = {executor.submit(_pr_is_still_open, pr): pr for pr in pr_numbers}
+
+        # We want to maintain original PR order, so we iterate through original list
+        # and lookup the corresponding future.
+        results_by_pr = {}
+        for future in concurrent.futures.as_completed(future_to_pr):
+            pr = future_to_pr[future]
+            try:
+                results_by_pr[pr] = ("success", future.result())
+            except CommandError as exc:
+                results_by_pr[pr] = ("error", exc)
+
+    for pr in pr_numbers:
+        status, result = results_by_pr[pr]
+        if status == "error":
+            _print_step(
+                "Could not confirm PR #{} open state ({}); keeping it in the "
+                "fan-out set.".format(pr, result)
+            )
             kept.append(pr)
-            continue
-        if still_open:
+        elif result is True:
             kept.append(pr)
         else:
             _print_step(
                 "PR #{} is no longer open (per gh pr view); skipping "
                 "fan-out spawn.".format(pr)
             )
+
     return kept
 
 
