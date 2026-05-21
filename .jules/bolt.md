@@ -1,0 +1,3 @@
+## 2026-05-21 - [Avoid Sequential Subprocess Execution Overhead]
+**Learning:** Checking states for multiple PRs sequentially using the GitHub CLI (`gh pr view`) via subprocess calls creates a significant N+1 performance bottleneck.
+**Action:** When performing independent API or CLI checks across multiple entities (e.g., multiple PRs), use `concurrent.futures.ThreadPoolExecutor` to parallelize the subprocess calls. This dramatically reduces latency and avoids performance bottlenecks.
