@@ -1,0 +1,3 @@
+## 2026-05-22 - [Performance Improvement] Concurrent GH CLI PR Checks
+**Learning:** Checking PR statuses one by one using a CLI tool like `gh pr view` inherently causes a slow, network-bound operation sequentially, which results in a severe N+1 bottleneck during a start-up or fan-out iteration process. This bottleneck significantly impedes process responsiveness when there are multiple PRs being evaluated.
+**Action:** Use Python's built-in `concurrent.futures.ThreadPoolExecutor` to handle multiple independent network-bound CLI subprocess checks concurrently instead of sequentially. Ensure order and error handling map accurately back to the calling process.
