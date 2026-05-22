@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+import concurrent.futures
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -543,24 +544,30 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
-    kept: List[int] = []
-    for pr in pr_numbers:
+    def check_pr(pr: int) -> Tuple[int, bool, Optional[str]]:
         try:
-            still_open = _pr_is_still_open(pr)
+            return pr, _pr_is_still_open(pr), None
         except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
-            _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
-                "fan-out spawn.".format(pr)
-            )
+            return pr, True, str(exc)
+
+    kept: List[int] = []
+    max_workers = min(10, len(pr_numbers)) if pr_numbers else 1
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for pr, still_open, error_msg in executor.map(check_pr, pr_numbers):
+            if error_msg:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, error_msg)
+                )
+                kept.append(pr)
+            elif still_open:
+                kept.append(pr)
+            else:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
     return kept
 
 
@@ -755,51 +762,64 @@ def _fan_out_all_prs(
                     del children[pr]
             if shutting_down["flag"]:
                 break
+            eligible_for_respawn = []
             for pr in list(last_exit_at.keys()):
                 if pr in children:
                     continue
                 backoff_for_pr = pending_backoff.get(pr, respawn_backoff)
                 if now - last_exit_at[pr] < backoff_for_pr:
                     continue
-                # Use a per-PR `gh pr view` only once the child is actually
-                # eligible for respawn. Checking on every supervisor sweep
-                # produces noisy repeated `gh pr view` bursts while the PR is
-                # still cooling down under backoff.
-                try:
-                    still_open = _pr_is_still_open(pr)
-                except CommandError as exc:
-                    _print_step(
-                        "Could not confirm PR #{} open state for respawn "
-                        "({}); keeping it in the respawn set.".format(pr, exc)
+                eligible_for_respawn.append(pr)
+
+            if eligible_for_respawn:
+                def check_pr_respawn(pr: int) -> Tuple[int, bool, Optional[str]]:
+                    try:
+                        return pr, _pr_is_still_open(pr), None
+                    except CommandError as exc:
+                        return pr, True, str(exc)
+
+                max_workers = min(10, len(eligible_for_respawn))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    respawn_results = list(executor.map(check_pr_respawn, eligible_for_respawn))
+
+                for pr, still_open, error_msg in respawn_results:
+                    # Use a per-PR `gh pr view` only once the child is actually
+                    # eligible for respawn. Checking on every supervisor sweep
+                    # produces noisy repeated `gh pr view` bursts while the PR is
+                    # still cooling down under backoff.
+                    if error_msg:
+                        _print_step(
+                            "Could not confirm PR #{} open state for respawn "
+                            "({}); keeping it in the respawn set.".format(pr, error_msg)
+                        )
+                        still_open = True
+                    if not still_open:
+                        _print_step(
+                            "PR #{} is no longer open; dropping from respawn "
+                            "set.".format(pr)
+                        )
+                        last_exit_at.pop(pr, None)
+                        pending_backoff.pop(pr, None)
+                        continue
+                    proc, log_path, log_handle = _spawn_child(
+                        pr=pr,
+                        script_path=script_path,
+                        base_child_args=base_child_args,
+                        log_root=log_root,
                     )
-                    still_open = True
-                if not still_open:
-                    _print_step(
-                        "PR #{} is no longer open; dropping from respawn "
-                        "set.".format(pr)
-                    )
+                    children[pr] = (proc, log_path, log_handle, time.monotonic())
                     last_exit_at.pop(pr, None)
-                    pending_backoff.pop(pr, None)
-                    continue
-                proc, log_path, log_handle = _spawn_child(
-                    pr=pr,
-                    script_path=script_path,
-                    base_child_args=base_child_args,
-                    log_root=log_root,
-                )
-                children[pr] = (proc, log_path, log_handle, time.monotonic())
-                last_exit_at.pop(pr, None)
-                # Intentionally keep pending_backoff[pr] across the respawn:
-                # the short-lived-failure ramp (30s -> 60s -> 120s -> ...) reads
-                # the previous value as ``prior`` and only escalates if it
-                # survives the respawn. The natural resets are the
-                # ordinary-exit and stuck-timeout branches above, which both
-                # rewrite pending_backoff to ``respawn_backoff``.
-                _print_step(
-                    "Respawned PR #{} pid={} (log: {})".format(
-                        pr, proc.pid, log_path
+                    # Intentionally keep pending_backoff[pr] across the respawn:
+                    # the short-lived-failure ramp (30s -> 60s -> 120s -> ...) reads
+                    # the previous value as ``prior`` and only escalates if it
+                    # survives the respawn. The natural resets are the
+                    # ordinary-exit and stuck-timeout branches above, which both
+                    # rewrite pending_backoff to ``respawn_backoff``.
+                    _print_step(
+                        "Respawned PR #{} pid={} (log: {})".format(
+                            pr, proc.pid, log_path
+                        )
                     )
-                )
     finally:
         if reload_requested["flag"]:
             _print_step(
