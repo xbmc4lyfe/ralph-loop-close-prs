@@ -8,6 +8,12 @@ from .config import LOOP_ALREADY_RUNNING_MESSAGE
 from .errors import CommandError, RebaseConflictError
 from .process import _print_step, _run_command
 
+
+def _validate_git_ref(ref: str):
+    if ref.startswith("-"):
+        raise CommandError(f"Invalid Git reference starting with a hyphen: '{ref}'")
+
+
 def _git_output(args: Sequence[str]) -> str:
     completed = _run_command(["git"] + list(args), check=True, capture_output=True)
     return (completed.stdout or "").strip()
@@ -38,6 +44,7 @@ def _working_tree_dirty() -> bool:
 
 
 def _checkout_branch(branch: str):
+    _validate_git_ref(branch)
     current_branch = _git_branch()
     if current_branch == branch:
         return
@@ -111,7 +118,7 @@ _REBASE_CONFLICT_PATTERNS = (
 
 
 def _fetch_with_retry(remote: str, ref: str):
-    import random as _random
+    import secrets as _secrets
     import time as _time
 
     last_exc: Optional[CommandError] = None
@@ -127,12 +134,15 @@ def _fetch_with_retry(remote: str, ref: str):
                 raise
             last_exc = exc
             delay = 0.5 * (2 ** attempt)
-            _time.sleep(delay + _random.uniform(0, delay))
-    assert last_exc is not None
+            _time.sleep(delay + _secrets.SystemRandom().uniform(0, delay))
+    if last_exc is None:
+        raise RuntimeError("Unreachable")
     raise last_exc
 
 
 def _rebase_onto_base(branch: str, base: str):
+    _validate_git_ref(branch)
+    _validate_git_ref(base)
     _print_step("Rebasing {} onto origin/{}".format(branch, base))
     _fetch_with_retry("origin", base)
     rebase = _run_command(

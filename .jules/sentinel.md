@@ -1,0 +1,4 @@
+## 2026-05-22 - Fix Git argument injection and secure random number generation
+**Vulnerability:** Git argument injection risks when fetching remote references, and use of insecure `random` module for cryptographic/security-sensitive operations (even if just for backoff jitter, standard practice suggests using `secrets`).
+**Learning:** Git CLI commands are vulnerable to argument injection if user-provided refs starting with a hyphen (`-`) are not validated, since Git may parse them as flags. Also, the static analyzer `bandit` correctly flagged `B311` for `random` module and `B101` for `assert` usage which could be optimized away.
+**Prevention:** Added `_validate_git_ref` to ensure no Git ref starts with a hyphen before executing `git checkout` or `git rebase`. Switched to `secrets.SystemRandom` to resolve `B311` warnings and improve security posture. Replaced `assert` with proper exceptions for `B101`.

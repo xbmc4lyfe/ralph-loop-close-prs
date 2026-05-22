@@ -11,6 +11,7 @@ from typing import Callable, Dict, Optional, Set
 
 from .config import LOOP_ALREADY_RUNNING_MESSAGE
 from .errors import LOOP_ALREADY_RUNNING_EXIT_CODE, CommandError
+from .git_ops import _validate_git_ref
 from .process import _print_step, _run_command
 
 def _slug(value: str) -> str:
@@ -346,6 +347,7 @@ def _pr_head_fetch_ref(pr_number: int) -> str:
 def _fetch_pr_branch_or_head(
     *, pr_number: int, branch: str, cwd: Optional[str] = None
 ) -> str:
+    _validate_git_ref(branch)
     fetch_branch = _run_command(
         ["git", "fetch", "origin", branch],
         check=False,
@@ -376,6 +378,7 @@ def _fetch_pr_branch_or_head(
 
 
 def _worktree_for_branch(branch: str) -> Optional[str]:
+    _validate_git_ref(branch)
     completed = _run_command(
         ["git", "worktree", "list", "--porcelain"],
         check=True,
@@ -491,6 +494,7 @@ def _sync_existing_worktree(*, path: str, start_ref: str):
 
 
 def _local_branch_exists(branch: str) -> bool:
+    _validate_git_ref(branch)
     result = _run_command(
         ["git", "show-ref", "--verify", "--quiet", "refs/heads/{}".format(branch)],
         check=False,
