@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import concurrent.futures
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -529,6 +530,12 @@ def _spawn_child(
     return proc, log_path, log_handle
 
 
+def _check_pr_for_filter(pr: int) -> Tuple[int, Optional[bool], Optional[Exception]]:
+    try:
+        return (pr, _pr_is_still_open(pr), None)
+    except CommandError as exc:
+        return (pr, None, exc)
+
 def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     """Drop PRs that are no longer OPEN/non-draft via a targeted gh pr view.
 
@@ -543,17 +550,23 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
+    # ⚡ Bolt Optimization: Use concurrent futures to avoid N+1 sequential gh subprocess calls
     kept: List[int] = []
-    for pr in pr_numbers:
-        try:
-            still_open = _pr_is_still_open(pr)
-        except CommandError as exc:
+    if not pr_numbers:
+        return kept
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(pr_numbers))) as executor:
+        results = executor.map(_check_pr_for_filter, pr_numbers)
+
+    for pr, still_open, exc in results:
+        if exc is not None:
             _print_step(
                 "Could not confirm PR #{} open state ({}); keeping it in the "
                 "fan-out set.".format(pr, exc)
             )
             kept.append(pr)
             continue
+
         if still_open:
             kept.append(pr)
         else:

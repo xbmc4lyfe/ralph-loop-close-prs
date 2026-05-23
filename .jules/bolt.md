@@ -1,0 +1,3 @@
+## 2026-05-23 - [Optimize PR filtering fan-out check]
+**Learning:** Subprocess calls to the GitHub CLI (`gh`), typically executed sequentially in a loop (e.g. checking if PRs are still open using `gh pr view`), are a significant performance bottleneck due to process startup and network roundtrip times for each PR. This N+1 execution model severely delays the main supervisor loop during scale-out.
+**Action:** When performing multi-PR queries or validations that rely on individual `gh` calls, use concurrency (like `concurrent.futures.ThreadPoolExecutor`) combined with mapping functions (`executor.map`) to issue the checks in parallel while preserving order.
