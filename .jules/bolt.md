@@ -1,0 +1,3 @@
+## 2025-02-15 - [Avoid N+1 subprocess bottleneck using concurrent.futures.ThreadPoolExecutor]
+**Learning:** Checking state for multiple PRs by executing sequential subprocess calls to the GitHub CLI ('gh') is a significant performance bottleneck due to the latency of process spawning and network requests in an N+1 pattern.
+**Action:** Always use concurrency (e.g., `concurrent.futures.ThreadPoolExecutor` and `executor.map`) when iterating over collections of entities that require subprocess calls to fetch their state, to avoid N+1 sequential execution delays. Use `executor.map` to preserve original order easily.
