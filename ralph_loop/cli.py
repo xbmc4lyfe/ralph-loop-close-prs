@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import concurrent.futures
 import re
 import shlex
 import signal
@@ -543,8 +544,7 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
-    kept: List[int] = []
-    for pr in pr_numbers:
+    def _check_pr(pr: int) -> Tuple[int, bool]:
         try:
             still_open = _pr_is_still_open(pr)
         except CommandError as exc:
@@ -552,15 +552,19 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
                 "Could not confirm PR #{} open state ({}); keeping it in the "
                 "fan-out set.".format(pr, exc)
             )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
+            return pr, True
+        if not still_open:
             _print_step(
                 "PR #{} is no longer open (per gh pr view); skipping "
                 "fan-out spawn.".format(pr)
             )
+        return pr, still_open
+
+    kept: List[int] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for pr, should_keep in executor.map(_check_pr, pr_numbers):
+            if should_keep:
+                kept.append(pr)
     return kept
 
 
