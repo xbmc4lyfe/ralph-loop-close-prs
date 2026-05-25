@@ -1,0 +1,3 @@
+## 2024-05-24 - `gh` CLI subprocess calls bottleneck
+**Learning:** Subprocess calls to the GitHub CLI (`gh`), typically executed sequentially in a loop (e.g., when checking states for multiple PRs), are a significant performance bottleneck due to process instantiation overhead and network latency. This results in N+1 sequential execution delays.
+**Action:** When performing independent `gh` CLI operations over a collection of items (like checking open states for multiple PRs), use concurrency (e.g., `concurrent.futures.ThreadPoolExecutor`) to execute the operations in parallel. Use `executor.map` to ensure the original order is preserved if order is important for subsequent logic.
