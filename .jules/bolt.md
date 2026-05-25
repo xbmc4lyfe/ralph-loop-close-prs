@@ -1,0 +1,3 @@
+## 2024-05-24 - [Performance Improvement] Concurrent PR Filtering
+**Learning:** Sequential subprocess calls (like `gh pr view`) in loops for filtering arrays of items can lead to an N+1 performance bottleneck. Subprocess calls to the GitHub CLI (`gh`) are relatively slow and their execution blocks the process.
+**Action:** Use concurrent execution, such as `concurrent.futures.ThreadPoolExecutor`, to parallelize these calls. Ensure you preserve the original array order by using `executor.map`, and properly wrap exceptions so that they are caught and handled similarly to a sequential loop.
