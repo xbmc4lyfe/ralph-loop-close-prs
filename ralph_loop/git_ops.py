@@ -8,6 +8,13 @@ from .config import LOOP_ALREADY_RUNNING_MESSAGE
 from .errors import CommandError, RebaseConflictError
 from .process import _print_step, _run_command
 
+def _validate_git_ref(ref: str) -> None:
+    if ref.startswith("-"):
+        raise CommandError(
+            "Invalid git reference '{}': cannot start with a hyphen (prevents argument injection)".format(ref)
+        )
+
+
 def _git_output(args: Sequence[str]) -> str:
     completed = _run_command(["git"] + list(args), check=True, capture_output=True)
     return (completed.stdout or "").strip()
@@ -38,6 +45,7 @@ def _working_tree_dirty() -> bool:
 
 
 def _checkout_branch(branch: str):
+    _validate_git_ref(branch)
     current_branch = _git_branch()
     if current_branch == branch:
         return
@@ -111,6 +119,8 @@ _REBASE_CONFLICT_PATTERNS = (
 
 
 def _fetch_with_retry(remote: str, ref: str):
+    _validate_git_ref(remote)
+    _validate_git_ref(ref)
     import random as _random
     import time as _time
 
@@ -133,6 +143,8 @@ def _fetch_with_retry(remote: str, ref: str):
 
 
 def _rebase_onto_base(branch: str, base: str):
+    _validate_git_ref(branch)
+    _validate_git_ref(base)
     _print_step("Rebasing {} onto origin/{}".format(branch, base))
     _fetch_with_retry("origin", base)
     rebase = _run_command(
