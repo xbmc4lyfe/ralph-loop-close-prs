@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import re
 import shlex
@@ -544,16 +545,31 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     swallow stale PRs because of a flaky network.
     """
     kept: List[int] = []
-    for pr in pr_numbers:
+
+    # ⚡ Bolt: Performance optimization
+    # Evaluate PRs concurrently to avoid N+1 sequential subprocess delays
+    def _check_pr(pr: int) -> Tuple[int, bool, Optional[Exception]]:
         try:
-            still_open = _pr_is_still_open(pr)
-        except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
+            return pr, _pr_is_still_open(pr), None
+        except Exception as exc:
+            return pr, False, exc
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(pr_numbers) or 1)) as executor:
+        results = list(executor.map(_check_pr, pr_numbers))
+
+    for pr, still_open, exc in results:
+        if exc is not None:
+            if isinstance(exc, CommandError):
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+                kept.append(pr)
+            else:
+                # Re-raise unexpected exceptions
+                raise exc
             continue
+
         if still_open:
             kept.append(pr)
         else:
