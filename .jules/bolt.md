@@ -1,0 +1,3 @@
+## 2024-05-26 - Add concurrency to _filter_to_still_open_prs
+**Learning:** Subprocess calls to the GitHub CLI ('gh') sequentially executed in loops are a significant performance bottleneck due to the startup time of the process and the network requests involved. This specifically causes delays proportional to the number of open PRs (N+1 queries equivalent).
+**Action:** Used `concurrent.futures.ThreadPoolExecutor` along with `executor.map` to perform parallel execution while preserving array order. In the future, always look out for loops involving `gh` CLI tools and consider whether they can be mapped to concurrent operations to improve latency.
