@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import re
 import shlex
@@ -542,25 +543,33 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     "keep this PR" — we only drop PRs that GitHub definitively reports as
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
+
+    Performance impact: Using a ThreadPoolExecutor here avoids N+1
+    sequential delays by running the gh CLI commands concurrently,
+    preserving order using executor.map.
     """
-    kept: List[int] = []
-    for pr in pr_numbers:
+    def _check_pr(pr: int) -> Tuple[int, bool]:
         try:
-            still_open = _pr_is_still_open(pr)
+            return pr, _pr_is_still_open(pr)
         except CommandError as exc:
             _print_step(
                 "Could not confirm PR #{} open state ({}); keeping it in the "
                 "fan-out set.".format(pr, exc)
             )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
-            _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
-                "fan-out spawn.".format(pr)
-            )
+            return pr, True
+
+    kept: List[int] = []
+    # Avoid spawning more threads than needed
+    max_workers = min(32, max(1, len(pr_numbers)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for pr, still_open in executor.map(_check_pr, pr_numbers):
+            if still_open:
+                kept.append(pr)
+            else:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
     return kept
 
 
