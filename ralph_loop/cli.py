@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -544,23 +545,30 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     swallow stale PRs because of a flaky network.
     """
     kept: List[int] = []
-    for pr in pr_numbers:
+
+    # ⚡ Bolt: Use concurrency to avoid N+1 sequential subprocess delays.
+    # Spawning independent `gh pr view` checks concurrently preserves time.
+    def _check_pr(pr: int) -> Tuple[int, bool]:
         try:
             still_open = _pr_is_still_open(pr)
+            if not still_open:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
+            return pr, still_open
         except CommandError as exc:
             _print_step(
                 "Could not confirm PR #{} open state ({}); keeping it in the "
                 "fan-out set.".format(pr, exc)
             )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
-            _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
-                "fan-out spawn.".format(pr)
-            )
+            return pr, True
+
+    with ThreadPoolExecutor(max_workers=min(10, max(1, len(pr_numbers)))) as executor:
+        for pr, keep in executor.map(_check_pr, pr_numbers):
+            if keep:
+                kept.append(pr)
+
     return kept
 
 
