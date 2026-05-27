@@ -12,6 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from contextlib import contextmanager
+import concurrent.futures
 from typing import Any, Dict, List, Optional, Tuple
 
 from .checks import _wait_for_required_checks_green
@@ -529,6 +530,13 @@ def _spawn_child(
     return proc, log_path, log_handle
 
 
+def _check_single_pr_open(pr: int) -> Tuple[int, bool, Optional[Exception]]:
+    try:
+        still_open = _pr_is_still_open(pr)
+        return pr, still_open, None
+    except Exception as exc:
+        return pr, True, exc  # Default to True (keep PR) on error
+
 def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     """Drop PRs that are no longer OPEN/non-draft via a targeted gh pr view.
 
@@ -544,16 +552,27 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     swallow stale PRs because of a flaky network.
     """
     kept: List[int] = []
-    for pr in pr_numbers:
-        try:
-            still_open = _pr_is_still_open(pr)
-        except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
+
+    # ⚡ Bolt: Optimize N+1 `gh pr view` subprocess calls by checking PR states concurrently.
+    # executor.map preserves the original order of pr_numbers.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(_check_single_pr_open, pr_numbers))
+
+    for pr, still_open, exc in results:
+        if exc is not None:
+            if isinstance(exc, CommandError):
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+            else:
+                _print_step(
+                    "Unexpected error checking PR #{} state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
             kept.append(pr)
             continue
+
         if still_open:
             kept.append(pr)
         else:
