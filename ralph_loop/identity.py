@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-import random
+import secrets
 import re
 import time
 
@@ -51,7 +51,7 @@ def _set_git_config_if_changed(key: str, value: str) -> None:
                 raise
             last_error = exc
             delay = _GIT_CONFIG_LOCK_BASE_DELAY * (2 ** attempt)
-            time.sleep(delay + random.uniform(0, delay))
+            time.sleep(delay + secrets.SystemRandom().uniform(0, delay))
             if _git_config_get(key) == value:
                 return
     raise last_error

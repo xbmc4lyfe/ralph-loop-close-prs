@@ -111,7 +111,7 @@ _REBASE_CONFLICT_PATTERNS = (
 
 
 def _fetch_with_retry(remote: str, ref: str):
-    import random as _random
+    import secrets as _secrets
     import time as _time
 
     last_exc: Optional[CommandError] = None
@@ -127,7 +127,7 @@ def _fetch_with_retry(remote: str, ref: str):
                 raise
             last_exc = exc
             delay = 0.5 * (2 ** attempt)
-            _time.sleep(delay + _random.uniform(0, delay))
+            _time.sleep(delay + _secrets.SystemRandom().uniform(0, delay))
     assert last_exc is not None
     raise last_exc
 
