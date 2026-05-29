@@ -543,24 +543,35 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
+    import concurrent.futures
+
     kept: List[int] = []
-    for pr in pr_numbers:
+
+    def _check_pr_state(pr: int) -> Tuple[int, bool, Optional[Exception]]:
         try:
-            still_open = _pr_is_still_open(pr)
+            return pr, _pr_is_still_open(pr), None
         except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
-            _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
-                "fan-out spawn.".format(pr)
-            )
+            return pr, False, exc
+
+    # Use ThreadPoolExecutor to check PR states concurrently to avoid N+1 delays.
+    # We preserve order using map, which is safe since each check is self-contained.
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(10, len(pr_numbers) or 1)
+    ) as executor:
+        for pr, still_open, exc in executor.map(_check_pr_state, pr_numbers):
+            if exc:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+                kept.append(pr)
+            elif still_open:
+                kept.append(pr)
+            else:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
     return kept
 
 
