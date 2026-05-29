@@ -1,5 +1,6 @@
 """Command-line interface and top-level orchestration."""
 from __future__ import annotations
+import concurrent.futures
 
 import argparse
 import os
@@ -544,23 +545,35 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     swallow stale PRs because of a flaky network.
     """
     kept: List[int] = []
-    for pr in pr_numbers:
+
+    def _check(pr: int) -> Tuple[int, bool, Optional[str]]:
         try:
-            still_open = _pr_is_still_open(pr)
+            return pr, _pr_is_still_open(pr), None
         except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
-            _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
-                "fan-out spawn.".format(pr)
-            )
+            return pr, True, str(exc)
+
+    if not pr_numbers:
+        return kept
+
+    # ⚡ Bolt Optimization: Use ThreadPoolExecutor to check PR states concurrently.
+    # Checking states for multiple PRs sequentially causes N+1 execution delays due to
+    # slow `gh` CLI subprocess calls. Concurrency avoids these bottlenecks.
+    # Expected performance impact: N times faster for N PRs, capped by max_workers=10.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(pr_numbers))) as executor:
+        for pr, still_open, error_msg in executor.map(_check, pr_numbers):
+            if error_msg:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, error_msg)
+                )
+                kept.append(pr)
+            elif still_open:
+                kept.append(pr)
+            else:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
     return kept
 
 
