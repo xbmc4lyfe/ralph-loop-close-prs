@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import concurrent.futures
 from dataclasses import dataclass, field
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -543,18 +544,25 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     not-OPEN. This matches the behaviour callers expect: do not silently
     swallow stale PRs because of a flaky network.
     """
-    kept: List[int] = []
-    for pr in pr_numbers:
+    def check_pr(pr: int) -> Tuple[int, bool, Optional[Exception]]:
         try:
-            still_open = _pr_is_still_open(pr)
+            return pr, _pr_is_still_open(pr), None
         except CommandError as exc:
+            return pr, True, exc
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(pr_numbers) or 1)) as executor:
+        results = list(executor.map(check_pr, pr_numbers))
+
+    kept: List[int] = []
+    for pr, still_open, exc in results:
+        if exc:
             _print_step(
                 "Could not confirm PR #{} open state ({}); keeping it in the "
                 "fan-out set.".format(pr, exc)
             )
             kept.append(pr)
-            continue
-        if still_open:
+        elif still_open:
             kept.append(pr)
         else:
             _print_step(
