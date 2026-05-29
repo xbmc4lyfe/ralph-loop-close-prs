@@ -38,6 +38,8 @@ def _working_tree_dirty() -> bool:
 
 
 def _checkout_branch(branch: str):
+    if branch.startswith("-"):
+        raise CommandError(f"Invalid branch name: {branch}")
     current_branch = _git_branch()
     if current_branch == branch:
         return
@@ -133,6 +135,10 @@ def _fetch_with_retry(remote: str, ref: str):
 
 
 def _rebase_onto_base(branch: str, base: str):
+    if branch.startswith("-"):
+        raise CommandError(f"Invalid branch name: {branch}")
+    if base.startswith("-"):
+        raise CommandError(f"Invalid base name: {base}")
     _print_step("Rebasing {} onto origin/{}".format(branch, base))
     _fetch_with_retry("origin", base)
     rebase = _run_command(
