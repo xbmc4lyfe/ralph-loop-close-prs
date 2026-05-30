@@ -1,0 +1,3 @@
+## 2024-06-25 - Parallelize GitHub CLI Subprocess Calls
+**Learning:** Sequential subprocess calls to the GitHub CLI (`gh`) during PR state checks create a significant performance bottleneck (N+1 problem) in the supervisor loop. Calling `_pr_is_still_open` for each PR individually delays the entire respawn/fan-out cycle linearly with the number of PRs.
+**Action:** Use concurrency (e.g., `concurrent.futures.ThreadPoolExecutor` with `executor.map`) when checking states for multiple PRs to execute these slow subprocess calls in parallel, preserving original order and drastically reducing cycle time.
