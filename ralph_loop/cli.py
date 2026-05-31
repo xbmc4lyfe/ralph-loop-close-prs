@@ -333,6 +333,8 @@ def _should_fan_out_implicitly(args: argparse.Namespace) -> bool:
 def _validate_pr_metadata(
     pr_data: Dict[str, Any], pr_number: int, expected_base: str
 ) -> str:
+    if expected_base.startswith("-"):
+        raise CommandError("Git argument injection detected: base branch starts with a hyphen.")
     if pr_data.get("state") != "OPEN":
         raise CommandError(
             "PR {} is not open (state={}).".format(
@@ -350,16 +352,21 @@ def _validate_pr_metadata(
             "branch.".format(pr_number)
         )
     pr_base = pr_data.get("baseRefName")
-    if pr_base and pr_base != expected_base:
-        raise CommandError(
-            "PR #{} targets base '{}' but --base is '{}'. Use the PR base branch.".format(
-                pr_number, pr_base, expected_base
+    if pr_base:
+        if isinstance(pr_base, str) and pr_base.startswith("-"):
+            raise CommandError("Git argument injection detected: PR base branch starts with a hyphen.")
+        if pr_base != expected_base:
+            raise CommandError(
+                "PR #{} targets base '{}' but --base is '{}'. Use the PR base branch.".format(
+                    pr_number, pr_base, expected_base
+                )
             )
-        )
 
     branch = pr_data.get("headRefName")
     if not branch:
         raise CommandError("Could not resolve PR head branch.")
+    if isinstance(branch, str) and branch.startswith("-"):
+        raise CommandError("Git argument injection detected: PR head branch starts with a hyphen.")
     if branch == expected_base:
         raise CommandError(
             "PR head branch '{}' matches base '{}'; aborting.".format(
