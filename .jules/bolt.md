@@ -1,0 +1,3 @@
+## 2026-06-01 - ⚡ Bolt: Use concurrent ThreadPoolExecutor for gh pr view checks
+**Learning:** Checking PR statuses sequentially via `gh pr view` for a large number of PRs creates a significant N+1 bottleneck, slowing down startup time considerably. Subprocesses and GitHub API rate limits exacerbate this sequential execution cost.
+**Action:** Use `concurrent.futures.ThreadPoolExecutor` combined with `executor.map` when performing network/subprocess checks across multiple PRs (e.g., in `_filter_to_still_open_prs`). Remember to capture the exceptions in a helper wrapper so `executor.map` can yield them in order for graceful handling and logging.
