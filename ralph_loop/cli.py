@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import signal
+import concurrent.futures
 import subprocess
 import sys
 import threading
@@ -544,23 +545,29 @@ def _filter_to_still_open_prs(pr_numbers: List[int]) -> List[int]:
     swallow stale PRs because of a flaky network.
     """
     kept: List[int] = []
-    for pr in pr_numbers:
+
+    def _check_pr(pr: int) -> Tuple[int, Optional[bool], Optional[Exception]]:
         try:
-            still_open = _pr_is_still_open(pr)
-        except CommandError as exc:
-            _print_step(
-                "Could not confirm PR #{} open state ({}); keeping it in the "
-                "fan-out set.".format(pr, exc)
-            )
-            kept.append(pr)
-            continue
-        if still_open:
-            kept.append(pr)
-        else:
-            _print_step(
-                "PR #{} is no longer open (per gh pr view); skipping "
-                "fan-out spawn.".format(pr)
-            )
+            return pr, _pr_is_still_open(pr), None
+        except Exception as exc:
+            return pr, None, exc
+
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        for pr, still_open, exc in executor.map(_check_pr, pr_numbers):
+            if exc is not None:
+                _print_step(
+                    "Could not confirm PR #{} open state ({}); keeping it in the "
+                    "fan-out set.".format(pr, exc)
+                )
+                kept.append(pr)
+                continue
+            if still_open:
+                kept.append(pr)
+            else:
+                _print_step(
+                    "PR #{} is no longer open (per gh pr view); skipping "
+                    "fan-out spawn.".format(pr)
+                )
     return kept
 
 
